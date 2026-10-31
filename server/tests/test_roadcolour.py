@@ -118,6 +118,27 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(b.decide("w1", ""), "red", "another process's earlier decision")
         self.assertEqual(b.get(["w1", "w2"]), {"w1": "red"})
 
+    def test_file_not_held_open(self):
+        # Windows cannot delete an open file (Clear cache, a test's temporary folder: WinError 32): nothing left open,
+        # no -wal / -shm beside it, and the cache folder cleared under a running server is no trouble
+        s = rc.Store(self.dir)
+        s.decide("w1", "red")
+        self.assertEqual(sorted(os.listdir(self.dir)), [f"roadcolour_v{rc.VERSION}.sqlite"])
+        os.remove(os.path.join(self.dir, f"roadcolour_v{rc.VERSION}.sqlite"))
+        self.assertEqual(s.get(["w1"]), {"w1": "red"}, "kept in memory")
+        self.assertEqual(s.decide("w2", ""), "")
+        self.assertEqual(rc.Store(self.dir).get(["w2"]), {"w2": ""}, "the file made again")
+
+    def test_undecided_asked_again_after_a_while(self):
+        a, b = rc.Store(self.dir), rc.Store(self.dir)
+        self.assertEqual(a.get(["w3"]), {})
+        b.decide("w3", "red")
+        self.assertEqual(a.get(["w3"]), {}, "not asked again at once")
+        old = rc.MISS_TTL_S
+        rc.MISS_TTL_S = 0.0
+        self.addCleanup(setattr, rc, "MISS_TTL_S", old)
+        self.assertEqual(a.get(["w3"]), {"w3": "red"}, "another process's decision, seen later")
+
     def test_memory_only_without_a_folder(self):
         s = rc.Store(None)
         self.assertEqual(s.decide("w1", ""), "")

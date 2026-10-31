@@ -21,10 +21,12 @@ Cost: sampling reads three pixels a metre of each undecided candidate road in a 
 the photo at once (numpy, no fetch): ~60 ms for 400 new roads in a 1 km town block photo (2026-10-31, one core), once;
 after that, and for every other photo, a dictionary lookup a road (~0.3 ms for 400).
 """
+import contextlib
 import logging
 import os
 import sqlite3
 import threading
+import time
 
 import numpy as np
 
@@ -60,6 +62,11 @@ MIN_CLEAN_SHARE = 0.5
 RED_SAT = 0.20
 RED_HUE = (-20.0, 22.0)
 RED_SHARE = 0.6
+
+# An undecided road is looked up in the file again after MISS_TTL_S (another process may have decided it); at most
+# about MISS_KEEP of those remembered
+MISS_TTL_S = 30.0
+MISS_KEEP = 50000
 
 
 def fine_photo(used, chain, texel_m):
@@ -162,32 +169,48 @@ class Store:
     def __init__(self, folder=None):
         self._lock = threading.Lock()
         self._known = {}
-        self._db = None
-        if folder:
-            try:
-                os.makedirs(folder, exist_ok=True)
-                db = sqlite3.connect(os.path.join(folder, f"roadcolour_v{VERSION}.sqlite"), timeout=5.0,
-                                     check_same_thread=False, isolation_level=None)
-                db.execute("PRAGMA journal_mode=WAL")
-                db.execute("CREATE TABLE IF NOT EXISTS decided (fid TEXT PRIMARY KEY, colour TEXT NOT NULL)")
-                self._db = db
-            except sqlite3.Error as e:
-                log.info("road colours kept in memory only: %s", e)
+        self._missing = {}          # fid -> when (time.monotonic) the file had no decision for it
+        self._path =os.path.join(folder, f"roadcolour_v{VERSION}.sqlite") if folder else None
+
+    def _open(self):
+        """A connection to the file, made for one read or write and closed after it (contextlib.closing): never held
+        open, as Windows cannot delete an open file (Clear cache, a test's temporary folder: WinError 32,
+        2026-10-31). The plain rollback journal leaves no -wal / -shm files beside it. None without a file."""
+        if self._path is None:
+            return None
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        db = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
+        db.execute("CREATE TABLE IF NOT EXISTS decided (fid TEXT PRIMARY KEY, colour TEXT NOT NULL)")
+        return contextlib.closing(db)
+
+    @staticmethod
+    def _select(db, fids):
+        out = {}
+        for k in range(0, len(fids), 500):
+            part = fids[k:k + 500]
+            out.update(db.execute(f"SELECT fid, colour FROM decided WHERE fid IN ({','.join('?' * len(part))})",
+                                  part).fetchall())
+        return out
 
     def get(self, fids):
-        """{fid: category or ""} of the decided ones among fids."""
+        """{fid: category or ""} of the decided ones among fids. A road found undecided in the file is not asked
+        again for MISS_TTL_S (where no photo can decide, Sentinel-2-only places, it never is: every far tile asked)."""
         with self._lock:
             out = {f: self._known[f] for f in fids if f in self._known}
-            ask = [f for f in fids if f not in self._known]
-            if ask and self._db is not None:
+            now = time.monotonic()
+            ask = [f for f in fids if f not in self._known and now - self._missing.get(f, -MISS_TTL_S) >= MISS_TTL_S]
+            if ask and self._path is not None:
                 try:
-                    for k in range(0, len(ask), 500):
-                        part = ask[k:k + 500]
-                        rows = self._db.execute(f"SELECT fid, colour FROM decided WHERE fid IN "
-                                                f"({','.join('?' * len(part))})", part).fetchall()
-                        for f, col in rows:
-                            self._known[f] = out[f] = col
-                except sqlite3.Error as e:
+                    with self._open() as db:
+                        got = self._select(db, ask)
+                    self._known.update(got)
+                    out.update(got)
+                    for f in ask:
+                        if f not in got:
+                            self._missing[f] = now
+                    if len(self._missing) > MISS_KEEP:
+                        self._missing = {f: t for f, t in self._missing.items() if now - t < MISS_TTL_S}
+                except (sqlite3.Error, OSError) as e:
                     log.debug("road colours: %s", e)
             return out
 
@@ -200,24 +223,22 @@ class Store:
         with self._lock:
             out = {f: self._known[f] for f in new if f in self._known}
             ask = {f: c for f, c in new.items() if f not in out}
-            if ask and self._db is not None:
+            for f in ask:
+                self._missing.pop(f, None)
+            if ask and self._path is not None:
                 try:
-                    self._db.execute("BEGIN")
-                    self._db.executemany("INSERT OR IGNORE INTO decided (fid, colour) VALUES (?, ?)",
-                                         list(ask.items()))
-                    self._db.execute("COMMIT")
-                    keys = list(ask)
-                    for k in range(0, len(keys), 500):
-                        part = keys[k:k + 500]
-                        for f, col in self._db.execute(f"SELECT fid, colour FROM decided WHERE fid IN "
-                                                       f"({','.join('?' * len(part))})", part):
-                            ask[f] = col
-                except sqlite3.Error as e:
+                    with self._open() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        try:
+                            db.executemany("INSERT OR IGNORE INTO decided (fid, colour) VALUES (?, ?)",
+                                           list(ask.items()))
+                            db.execute("COMMIT")
+                        except sqlite3.Error:
+                            db.execute("ROLLBACK")
+                            raise
+                        ask.update(self._select(db, list(ask)))
+                except (sqlite3.Error, OSError) as e:
                     log.debug("road colours: %s", e)
-                    try:
-                        self._db.execute("ROLLBACK")
-                    except sqlite3.Error:
-                        pass
             self._known.update(ask)
             out.update(ask)
             return out
