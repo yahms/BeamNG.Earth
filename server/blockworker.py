@@ -1834,7 +1834,9 @@ def base_photo(lat, lon, x0, y0, size, px, tex, buildings, rock_zoom, path, cach
     if roadsmod.ROADS_IN_GROUND:          # (earthd.Server.write_base)
         try:
             import surface as surfacemod
-            rgb = surfacemod.paint_square(rgb, frame, x0, y0, size, getattr(_s, "surface", None), _s.widths)
+            import roadcolour
+            rgb = surfacemod.paint_square(rgb, frame, x0, y0, size, getattr(_s, "surface", None), _s.widths,
+                                          learn=roadcolour.fine_photo(used, im.chain, size / px))
         except Exception as e:      # the photo stays as it is
             log.info("base photo: roads: %s", e)
     try:            # (earthd.Server.write_base)
@@ -1918,8 +1920,10 @@ def _far_tile(aid, lat, lon, tile, zoom, q, ref_zoom, with_sink, layout, tex, ma
     import roads as roadsmod
     if roadsmod.ROADS_IN_GROUND:          # (earthd.Server.road_faces)
         try:
+            import roadcolour
             import surface as surfacemod
-            rgb = surfacemod.paint_square(rgb, frame, *sq, getattr(_s, "surface", None), _s.widths)
+            rgb = surfacemod.paint_square(rgb, frame, *sq, getattr(_s, "surface", None), _s.widths,
+                                          learn=roadcolour.fine_photo(used, im.chain, tile.size / px))
         except Exception as e:
             log.debug("road faces of %s: %s", tile.key, e)
     if mask:                            # (earthd.Server.write_road_mask)

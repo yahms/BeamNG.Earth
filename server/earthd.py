@@ -87,6 +87,7 @@ import colormatch as colormatchmod  # noqa: E402
 import credits as creditsmod  # noqa: E402
 import covermap as covermapmod  # noqa: E402
 import areas as areasmod  # noqa: E402
+import roadcolour  # noqa: E402
 import surface as surfacemod  # noqa: E402
 import navgraph as navgraphmod  # noqa: E402
 import prewarm as prewarmmod  # noqa: E402
@@ -2245,7 +2246,9 @@ class Server:
         stamps.append(("buildings", time.perf_counter()))
         if roadsmod.ROADS_IN_GROUND and not quick:      # the carriageways in the ground (surface.photo_roads)
             try:
-                rgb = surfacemod.paint_square(rgb, anchor.frame, x0, y0, size, self.surface, self.road_widths)
+                rgb = surfacemod.paint_square(rgb, anchor.frame, x0, y0, size, self.surface, self.road_widths,
+                                              learn=roadcolour.fine_photo(used, self.imagery.chain,
+                                                                          size / BASE_RENDER_PX))
             except Exception as e:      # the photo stays as it is
                 log.info("base photo %s: roads: %s", (anchor.id, cx, cy), e)
         stamps.append(("roads", time.perf_counter()))
@@ -2690,7 +2693,7 @@ class Server:
                         geo_wait = time.perf_counter() - w0
                     rgb = self.rock_faces(anchor, tile, px, rgb, built.grid)
                     if not is_global:
-                        rgb = self.road_faces(anchor, node, px, rgb)
+                        rgb = self.road_faces(anchor, node, px, rgb, used)
                         self.write_road_mask(anchor, node, px, texture)
                     tex_bytes = imagerymod.write_dds(os.path.join(self.out_dir, texture), rgb)
                     self.keep_texture(tk, texture, tex_bytes, used, pending, f0)
@@ -2800,15 +2803,18 @@ class Server:
             log.debug("rock faces of %s: %s", tile.key, e)
             return rgb
 
-    def road_faces(self, anchor, tile, px, rgb):
+    def road_faces(self, anchor, tile, px, rgb, used=None):
         """The far tile's photo with the carriageways painted in (roads.ROADS_IN_GROUND, surface.paint_square: the
-        near ring the drawn block does not cover); as it was otherwise or if that fails."""
+        near ring the drawn block does not cover); as it was otherwise or if that fails. used: its render's sources
+        (Imagery.render), letting a fine near tile decide road colours (roadcolour.fine_photo)."""
         if not roadsmod.ROADS_IN_GROUND:
             return rgb
         try:
             x0, y0, _, _ = tile.bbox
+            learn = used is not None and self.imagery is not None and \
+                roadcolour.fine_photo(used, self.imagery.chain, tile.size / px)
             return surfacemod.paint_square(rgb, anchor.frame, *imagerymod.gutter_square(x0, y0, tile.size, px),
-                                           self.surface, self.road_widths)
+                                           self.surface, self.road_widths, learn=learn)
         except Exception as e:          # the photo as it is
             log.debug("road faces of %s: %s", tile.key, e)
             return rgb
@@ -2850,7 +2856,7 @@ class Server:
         node = tile.base if isinstance(tile, farfield.Piece) else tile
         ck = self.far_ck(anchor.id, tile.key)
         if not isinstance(tile, farfield.GTile):
-            rgb = self.road_faces(anchor, node, px, rgb)
+            rgb = self.road_faces(anchor, node, px, rgb, used)
         texture = self.texture_name(*ck, prev.rev + 1)
         if not isinstance(tile, farfield.GTile):
             self.write_road_mask(anchor, node, px, texture)

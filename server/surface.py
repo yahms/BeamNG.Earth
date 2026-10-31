@@ -32,6 +32,7 @@ import mapgeom
 import heightmap
 import mapcells
 import revisit
+import roadcolour
 import roads as roadsmod
 import staging
 
@@ -431,15 +432,21 @@ def _corner_mask(feats_list, urban_fn, widths, lonlat_bounds, to_px, shape, grow
 # roundabout approaches even after island grass fill (Chavagnes-en-Paillers 2026-10-28)
 PHOTO_ROAD_RGBA = {"dirt": (122, 104, 82, 0.45), "gravel": (128, 118, 102, 0.6), "cobble": (112, 104, 96, 0.85),
                    "paved": (95, 95, 94, 1.0)}
+# coloured asphalt (roadcolour.py, GitHub #466): "paved:<category>", after "paved" so a red road stays red across the
+# junctions of the grey streets meeting it
+PHOTO_ROAD_RGBA.update({f"paved:{k}": (*rgb, 1.0) for k, rgb in roadcolour.CATEGORIES.items()})
 PHOTO_ROADS_MAX_TEXEL = 2.0     # m per texel: coarser far tiles keep the photo's own roads (far, under a pixel wide)
 PHOTO_ROAD_EDGE_M = 0.2         # m the photo's asphalt reaches past the drawn edge, under the edge decal's inner sliver (its
                                 # antialiased rim left a pale hair between the edge line and the decal)
 
 
-def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None, roads_of=None):
+def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None, roads_of=None, coloured=False,
+                   learn=None):
     """(segs (m, 4), half widths (m,), kind index into PHOTO_ROAD_RGBA (m,)) of the carriageways of feats_list in pixel
     coordinates of a w x h photo over [x0, x0 + size] x [y0, y0 + size] (row 0 north), or None when none is in it.
-    roads_of: a list that gets, per segment, (its road's number, its road has no curb: roads.has_sidewalks)."""
+    roads_of: a list that gets, per segment, (its road's number, its road has no curb: roads.has_sidewalks).
+    coloured: the paved roads roadcolour.colours names get their "paved:<category>" kind; learn: the photo (w x h,
+    before the roads are painted) it may decide undecided roads from (roadcolour.fine_photo), None: decided only."""
     px_m = w / size
     kinds = list(PHOTO_ROAD_RGBA)
     segs, hws, kind = [], [], []
@@ -451,6 +458,7 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
         specs = roadsmod.road_specs(feats, urban_fn, widths)
         box = _feature_boxes(feats, frame)
         ids = feats.ids.tolist()
+        mine = []       # coloured: (index, fid, its segment blocks [a, b) in kind, its rings in pixels)
         for i in range(len(feats)):
             fid = str(ids[i])
             sp = specs[i]
@@ -461,6 +469,7 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
             if box[i, 1] < x0 - m or box[i, 0] > x0 + size + m or box[i, 3] < y0 - m or box[i, 2] > y0 + size + m:
                 continue
             hw = (sp.width / 2 + PHOTO_ROAD_EDGE_M) * px_m
+            a, rings = len(kind), []
             for ring in roadsmod.ground_parts(feats, i):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
                 c = (np.asarray(e) - x0) * px_m
@@ -470,10 +479,22 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
                 segs.append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
                 hws.append(np.full(len(c) - 1, hw))
                 kind.append(np.full(len(c) - 1, kinds.index(sp.kind), np.uint8))
+                rings.append((c, r, sp.width / 2 * px_m))
                 if roads_of is not None:
                     roads_of.append((np.full(len(c) - 1, nroad, np.int64),
                                      np.full(len(c) - 1, not roadsmod.has_sidewalks(sp) and sp.kind == "paved")))
+            if coloured and sp.kind == "paved" and rings:
+                mine.append((i, fid, a, len(kind), rings))
             nroad += 1
+        if mine:
+            rings_of = {i: rr for i, _, _, _, rr in mine}
+            got = roadcolour.colours(feats, specs, [(i, fid) for i, fid, _, _, _ in mine],
+                                     learn=None if learn is None else (learn, lambda i: rings_of.get(i, ()), px_m))
+            for _, fid, a, b, _ in mine:
+                col = got.get(fid)
+                if col is not None:
+                    for k in range(a, b):
+                        kind[k][:] = kinds.index(f"paved:{col}")
     # ramp gores (markings.gores: the wedge between a ramp and its motorway is paved): as more paved segments
     for hw_, mid in gore_fills(frame, feats_list, (x0 - 300, y0 - 300, x0 + size + 300, y0 + size + 300), urban_fn,
                                widths):
@@ -721,18 +742,21 @@ def _fill_island_photos(rgb, polys):
     return np.asarray(im)
 
 
-def photo_roads(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
+def photo_roads(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None, learn=None):
     """The photo rgb (H x W x 3, row 0 = north, covering [x0, x0 + size] x [y0, y0 + size] of frame) with the
     carriageways of feats_list (road Features: roads.road_specs widths, ground parts only) painted in, antialiased
-    (earthfast.paint_lines, PHOTO_ROAD_RGBA). Roundabout footprints are filled with grass first so the photo's old
-    through-road scar does not show; carriageways paint over the ring. Pure (a new array)."""
+    (earthfast.paint_lines, PHOTO_ROAD_RGBA), asphalt in its colour category where roadcolour has one. Roundabout
+    footprints are filled with grass first so the photo's old through-road scar does not show; carriageways paint over
+    the ring. learn: None, or the photo as rendered (rgb's size, nothing painted on it yet) when it may decide road
+    colours (roadcolour.fine_photo). Pure (a new array) but for those decisions."""
     fast.require(49, "roads in the ground")
     h, w = rgb.shape[:2]
+    photo = None if learn is None or np.shape(learn)[:2] != (h, w) else np.asarray(learn, np.uint8)
     # the rounded corners of curbless junctions (roadcorners.py) in the asphalt's colour, under the roads
     rgb = photo_corners(rgb, frame, x0, y0, size, corner_pads(frame, x0, y0, size, feats_list, urban_fn, widths))
     filled = _fill_island_photos(np.ascontiguousarray(rgb, np.uint8),
                                  _island_pixel_polys(frame, x0, y0, size, w, h, feats_list, urban_fn, widths))
-    got = _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths)
+    got = _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths, coloured=True, learn=photo)
     if got is None:
         return filled
     colors = np.array([PHOTO_ROAD_RGBA[k] for k in PHOTO_ROAD_RGBA], np.float32)
@@ -782,18 +806,20 @@ def _square_lots(frame, x0, y0, size, surface):
     return surface.lots(la, lo)
 
 
-def paint_square(rgb, frame, x0, y0, size, surface, widths=None):
+def paint_square(rgb, frame, x0, y0, size, surface, widths=None, learn=False):
     """photo_roads for a ground photo over [x0, x0 + size]² of frame with the roads of surface's cached cells (a
     Surface; never waits); as it was when its texels are coarser than PHOTO_ROADS_MAX_TEXEL or no cell is cached.
-    Parking lots are painted first (photo_lots), then gas-station pads, then the carriageways over both."""
+    Parking lots are painted first (photo_lots), then gas-station pads, then the carriageways over both. learn: the
+    photo may decide road colours (roadcolour.fine_photo of its render)."""
     if surface is None or size / max(rgb.shape[1], 1) > PHOTO_ROADS_MAX_TEXEL:
         return rgb
+    photo = rgb if learn else None          # (the road colours are read before the lots and pads are painted)
     rgb = photo_lots(rgb, frame, x0, y0, size, _square_lots(frame, x0, y0, size, surface))
     rgb = photo_pads(rgb, frame, x0, y0, size, _square_pads(frame, x0, y0, size, surface))     # (under the roads)
     feats = _square_roads(frame, x0, y0, size, surface)
     if not feats:
         return rgb
-    return photo_roads(rgb, frame, x0, y0, size, feats, surface.urban, widths)
+    return photo_roads(rgb, frame, x0, y0, size, feats, surface.urban, widths, learn=photo)
 
 
 def unghost_square(rgb, frame, x0, y0, size, surface, widths=None):
@@ -845,8 +871,8 @@ def road_mask(frame, x0, y0, size, px, surface, widths=None):
         if feats else None
     out = None
     if got is not None:
-        colors = np.array([(255.0, 255.0, 255.0, 1.0 if k in ROAD_MASK_KINDS else 0.0) for k in PHOTO_ROAD_RGBA],
-                          np.float32)
+        colors = np.array([(255.0, 255.0, 255.0, 1.0 if k.split(":")[0] in ROAD_MASK_KINDS else 0.0)
+                           for k in PHOTO_ROAD_RGBA], np.float32)
         out = fast._ef.paint_lines(np.zeros((px, px, 3), np.uint8), *got, colors)[..., 0]
     for extra in (pads, lots, corners):
         if extra is not None:
