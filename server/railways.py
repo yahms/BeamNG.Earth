@@ -263,22 +263,25 @@ def road_underpasses(frame, cells, box, reach=REACH_M):
 # under the Балмошная–Лёвшино line, a walled trench 400 m long where the street is at grade under an embankment.
 COARSE_AT = None
 COARSE_PIECE_M = 25.0
-# ... and anywhere the elevation shows no grade separation at all (a rail bridge built after the survey: Davis Road
+# ... and on lidar wherever the elevation shows no grade separation (a rail bridge built after the survey: Davis Road
 # under the Armadale Line at Kelmscott, WA, where the 5 m DEM still has the old level crossing; the underpass rule dug
-# the street 8 m under the rail and carried the trench through its junction with Albany Highway, the user 2026-10-29).
-# A crossing whose road lies less than FLAT_SEP_M under the bridge's ends in the natural ground (RAW_ELEV: the server
-# sets it to the grader's own elevation, PROFILE_ZOOM) is treated as on coarse elevation: the track is raised, the
-# road left at grade. grading._lower_underpasses asks flat_rail_crossing too, so the two always agree.
-FLAT_SEP_ON = os.environ.get("BNE_RAIL_FLAT_SEP", "1") != "0"
-FLAT_SEP_M = 2.5
+# the street 8 m under the rail, the user 2026-10-29). grading's UNDER_LIDAR rule (PR #504) keeps such a road at its
+# own level where the deck (its ends' ground) stands less than roads.AT_GRADE_M over it; flat_rail_crossing asks the
+# same of a rail bridge, so every crossing that rule leaves at grade gets its track raised over the road (as on coarse
+# elevation), not a deck lying across the road. RAW_ELEV: the server sets it to the grader's own elevation
+# (PROFILE_ZOOM). Off with BNE_RAIL_FLAT_SEP=0, or with the rule itself (BNE_UNDER_LIDAR=off).
+FLAT_SEP_ON = os.environ.get("BNE_RAIL_FLAT_SEP", "1") != "0" and os.environ.get("BNE_UNDER_LIDAR", "on") != "off"
+FLAT_SEP_M = roads.AT_GRADE_M
 FLAT_SAMPLE_M = (-12.0, -6.0, 0.0, 6.0, 12.0)  # m along the road either side of the crossing (the median)
 RAW_ELEV = None
 
 
 def flat_rail_crossing(frame, bridge_xy, road_xy, at, elev=None):
     """Does the natural ground show no separation where road_xy (k, 2) crosses under the rail bridge bridge_xy at arc
-    at (m along the road)? The road's ground there (the median of FLAT_SAMPLE_M) under FLAT_SEP_M below the lower of
-    the bridge's ends. elev(lat, lon): RAW_ELEV by default; False without one (as before). Pure given elev."""
+    at (m along the road)? As grading's UNDER_LIDAR rule: the deck there (its ends' ground, interpolated along it, the
+    lowest within roads.DECK_CLEAR_REACH_M of the crossing) stands less than FLAT_SEP_M (roads.AT_GRADE_M) over the
+    road's ground (the median of FLAT_SAMPLE_M). elev(lat, lon): RAW_ELEV by default; False without one (as before).
+    Pure given elev."""
     elev = elev if elev is not None else RAW_ELEV
     if not FLAT_SEP_ON or elev is None:
         return False
@@ -294,7 +297,14 @@ def flat_rail_crossing(frame, bridge_xy, road_xy, at, elev=None):
         return False
     if not np.all(np.isfinite(z)):
         return False
-    return bool(min(z[-2], z[-1]) - float(np.median(z[:-2])) < FLAT_SEP_M)
+    # (where along the bridge the road crosses: the deck within roads.DECK_CLEAR_REACH_M of it, as the rule takes it)
+    sb = _arc(b)
+    L = max(float(sb[-1]), 1e-9)
+    hits = _seg_hits(b, road_xy)
+    arc_b = hits[0] if hits else 0.5 * L
+    corridor = np.clip([arc_b - roads.DECK_CLEAR_REACH_M, arc_b + roads.DECK_CLEAR_REACH_M], 0.0, L)
+    deck = float(np.min(z[-2] + (z[-1] - z[-2]) * corridor / L))
+    return bool(deck < float(np.median(z[:-2])) + FLAT_SEP_M)
 
 
 def _coarse_here(frame, box):

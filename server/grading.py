@@ -1968,7 +1968,7 @@ class _Planner:
             if k2 not in seen:
                 seen.add(k2)
                 uniq.append((b, fixed, rail))
-        spans, span_rail = [], []
+        spans = []
         ue = np.array([[b[0, :2], b[-1, :2]] for b, _f, _r in uniq], f64)        # (n, 2 ends, 2)
         coarse = self._coarse(key)      # (there the railway rises over the road: railways.coarse_underpasses)
         for n, (b, fixed, rail) in enumerate(uniq):
@@ -1981,7 +1981,6 @@ class _Planner:
             d[n] = np.inf                       # (another part's end within 0.75 m of either of its ends: joined)
             if rail or not (d < 0.75).any():
                 spans.append((b, L, fixed))
-                span_rail.append(rail)
         if not spans:
             return
         gids = sorted(ground)
@@ -2013,15 +2012,6 @@ class _Planner:
                 b, L, fixed = spans[bi]
                 if arc_b < APPROACH_MIN_CROSS_M or arc_b > L - APPROACH_MIN_CROSS_M:
                     continue                    # a junction at the bridge's end
-                if span_rail[bi]:
-                    # (the ground shows no separation: the track is raised over the road instead, as on coarse
-                    # elevation: railways.flat_rail_crossing, asked with the same ground there)
-                    import railways
-                    tt = np.clip(((pt - xy[:-1]) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
-                    jj = int(np.argmin(np.linalg.norm(xy[:-1] + tt[:, None] * ab - pt, axis=1)))
-                    s_x = float(s[jj] + tt[jj] * (s[jj + 1] - s[jj]))
-                    if railways.flat_rail_crossing(self.frame, b, xy, s_x, self.elev):
-                        continue
                 ze = deck_ends(bi)
                 corridor = np.clip([arc_b - roadsmod.DECK_CLEAR_REACH_M, arc_b + roadsmod.DECK_CLEAR_REACH_M], 0.0, L)
                 deck = float(np.min(ze[0] + (ze[1] - ze[0]) * corridor / L))
