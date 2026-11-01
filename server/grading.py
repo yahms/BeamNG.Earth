@@ -1921,8 +1921,12 @@ class _Planner:
                     if lift < APPROACH_MIN_LIFT:
                         continue
                 measured = len(got) > 4 and got[4] is not None
+                # (a solved crossing's approach walled beside the road at grade, as a measured one: the street splitting
+                # into its two carriageways past Wezep's A28 deck, 19 m off its abutment, held the ramp's 1:2 fill to
+                # 3.3 m of 4.7, its deck end 1 m under the ramp, a dip where the deck met it, the user 2026-11-01)
+                solved = len(got) > 6 and bool(got[5])
                 a = approach_add(p.xy, at_end, lift, p.half, others,
-                                 MEASURED_SIDE_RUN if measured else SLOPE_RUN)
+                                 MEASURED_SIDE_RUN if measured or solved else SLOPE_RUN)
                 if a is not None:
                     add = a if add is None else np.maximum(add, a)
             if add is not None:
@@ -2178,7 +2182,8 @@ class _Planner:
         for line, half in approaches:
             at_end = bool(np.hypot(*(line[-1] - xy)) <= np.hypot(*(line[0] - xy)))
             a = approach_add(line, at_end, lift, half, others,
-                             MEASURED_SIDE_RUN if (len(got) > 4 and got[4] is not None) else SLOPE_RUN)
+                             MEASURED_SIDE_RUN if (len(got) > 4 and got[4] is not None) or (len(got) > 6 and got[5])
+                             else SLOPE_RUN)
             if a is not None:
                 best = max(best, float(a[-1] if at_end else a[0]))
         return best
@@ -2522,6 +2527,12 @@ class _Planner:
         ground, others, approaches = [], [], []
         chain = bridge_chain(bridge, bridges)
         spans = [bridge] + chain        # (a road under any part of the chain is spanned, not beside the ramp: #138)
+        if sol is not None:
+            # (and under the decks beside it: a dual carriageway's other deck over the same road. The street passing
+            # under Wezep's other A28 deck, 10 m off, capped this one's ramp at its abutment: the deck's end 1 m under
+            # its ramp, a dip where it met the ground, the user 2026-11-01)
+            spans = spans + [b for b in bridges if b is not bridge and len(b) >= 2
+                             and float(np.min(np.hypot(*(b[:, :2] - xy).T))) <= TWIN_M]
         blo = np.min([b.min(0) for b in spans], axis=0)
         bhi = np.max([b.max(0) for b in spans], axis=0)
         lines, halves, lo_l, hi_l, first, last = self._ground_table(keys, cs)
