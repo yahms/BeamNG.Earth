@@ -2056,7 +2056,13 @@ class _Planner:
                 # separation; lidar's fill under the deck taken off whatever the deck does)
                 k = int(np.argmin([np.hypot(*(q - pt)) for q, _t in sol["cross"]]))
                 if np.hypot(*(sol["cross"][k][0] - pt)) <= 5.0:
-                    target = max(sol["cross"][k][1], z - UNDER_MAX_DROP_M)
+                    # (off lidar, no higher than what the deck as its ramps raised it clears: one held down by the
+                    # roads beside its ramps leaves the rest to the road under, as before. On lidar, as #504: the deck
+                    # rises over the road instead, whose ground the lidar has)
+                    target = sol["cross"][k][1] if lidar else min(sol["cross"][k][1], top)
+                    target = max(target, z - UNDER_MAX_DROP_M)
+                    if UNDER_SEA_ON and z >= floor:
+                        target = max(target, floor)
                     if target < z - 0.1:
                         requirements.append((i, sc, z - target))
                         xs_floor.append((np.asarray(pt, f64), target, _road_fids(i, lines, [ground[g][3] for g in gids],
@@ -2098,8 +2104,6 @@ class _Planner:
             offset[near] = got
             z0 = np.asarray(p.z, f64)
             z1 = z0 + offset
-            if UNDER_SEA_ON:                    # (every point: a dip's flat and ramps, a joined road's share)
-                z1 = np.where(z0 >= UNDER_POLDER_M, np.maximum(z1, np.minimum(z0, floor)), z1)
             if xs_floor:
                 # (crossings.ON: a solved crossing's target is a height, not a depth: the dip, made as a depth from the
                 # road's ground there, went on 1.5 m under it where the plan beside lidar's fill was already lower,
@@ -2116,6 +2120,8 @@ class _Planner:
                         cap = t + np.maximum(dq - reach, 0.0) * UNDER_GRADE
                         z1 = np.where(dq <= XS_FLOOR_M, np.minimum(z1, np.maximum(cap, np.minimum(z0, t))), z1)
                     z1 = np.where(dq <= XS_FLOOR_M, np.maximum(z1, np.minimum(z0, t)), z1)
+            if UNDER_SEA_ON:                    # (every point: a dip's flat and ramps, a joined road's share)
+                z1 = np.where(z0 >= UNDER_POLDER_M, np.maximum(z1, np.minimum(z0, floor)), z1)
             np_ = Plan(p.xy, z1, p.half, p.abut, p.cut, p.road_half)
             np_.rid, np_.max_wall, np_.bank = p.rid, p.max_wall, getattr(p, "bank", None)
             np_.steep = getattr(p, "steep", False)
