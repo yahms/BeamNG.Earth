@@ -293,8 +293,18 @@ UNDER_ANY_ON = os.environ.get("BNE_UNDERPASS_ANY", "on") != "off"
 # ramps for those bridges (a motorway's too); the rules above decide for every other.
 import crossings as _xs
 import carriageways as _cw
-CW_ON = _xs.ON and os.environ.get("BNE_CARRIAGEWAYS", "off") == "on"          # carriageways.py: a motorway's roads and decks as one profile (with BNE_INTERCHANGE)
+CW_ON = _xs.ON and os.environ.get("BNE_CARRIAGEWAYS", "on") != "off"          # carriageways.py: a motorway's roads and decks as one profile (with BNE_INTERCHANGE)
 CW_MAX_M = 8000.0       # m: a carriageway chain is cut here (a branch point or a loose end comes long before)
+CW_HEADROOM_M = roadsmod.MIN_BRIDGE_HEADROOM_M + roadsmod.BRIDGE_HEADROOM_MARGIN_M   # m of headroom the carriageways
+                        # keep over one another, the roads and the tracks under them (+ the deck's depth): the decks' own
+                        # (roads.deck_road_clear), so their girders clear what they span
+CW_NONFAM_HI = False    # other roads' decks over a carriageway bound it: off (their decks rise over it as before; from their
+                        # ends' ground a deck read low and dipped the Mitchell Freeway ~1 m under each street bridge)
+CW_MIN_SIN = 0.3        # two carriageways crossing at a flatter angle are not a grade separation (lines along each other)
+CW_MAX_DIG_M = 2.5      # m a carriageway is lowered at most under another road's deck (the deck is low for the rest)
+CW_UNDER_M = 10.0       # m from a deck's line the ground under it is not trusted, rising to trusted at twice that
+CW_MARGIN_M = 1200.0    # m past its home cell a cluster's chains reach (the farthest barely move the cell's)
+CW_CLUSTER_M = 30000.0  # m of carriageways solved together at most (the far ones barely move the near)
 XS_ON = _xs.ON
 XS_FIXED_GRADE = 0.03   # a solved motorway's or trunk's ramps rise at this (_lift_approaches)
 XS_FLOOR_M = 150.0      # m round a solved crossing no road is dug under its target (_lower_underpasses)
@@ -1421,16 +1431,17 @@ class _Planner:
                     self._lift_approaches(key, plans, pspecs)
                 except Exception as e:      # ungraded approaches rather than no grading
                     log.debug("grading: approaches of %s: %s: %s", key, type(e).__name__, e)
-            if UNDER_ON and plans:
-                try:
-                    self._lower_underpasses(key, plans)
-                except Exception as e:      # as the data has it rather than no grading
-                    log.debug("grading: underpasses of %s: %s: %s", key, type(e).__name__, e)
+            # (the carriageways' profiles before the dips: a motorway under another road's low deck still dips)
             if CW_ON and plans:
                 try:
                     self._apply_carriageways(plans, pspecs)
                 except Exception as e:      # as they were rather than no grading
                     log.debug("grading: carriageways of %s: %s: %s", key, type(e).__name__, e)
+            if UNDER_ON and plans:
+                try:
+                    self._lower_underpasses(key, plans)
+                except Exception as e:      # as the data has it rather than no grading
+                    log.debug("grading: underpasses of %s: %s: %s", key, type(e).__name__, e)
             if JUNCTION_SNAP_ON and plans and (APPROACH_ON or UNDER_ON):
                 # the side roads again, at their roads' heights after the approaches' lifts and the underpasses' dips
                 # (snapped before them, every alley along Baltimore's Haven Street stood up to 3.5 m over the street
@@ -2033,7 +2044,7 @@ class _Planner:
                     got[1] += self._end_raised(b[-1])
                 ez[j] = got
             return got
-        cands, decks, cand_xs = [], [], []
+        cands, decks, cand_xs, cand_cw = [], [], [], []
         for i, cr in enumerate(crs):
             if not cr:
                 continue
@@ -2065,6 +2076,8 @@ class _Planner:
                 cands.append((i, float(s[j] + t[j] * (s[j + 1] - s[j])), deck - clear))
                 decks.append(deck)
                 cand_xs.append((bi, pt))
+                cand_cw.append(None if cz is None else deck - (CW_HEADROOM_M + roadsmod.deck_depth(
+                    roadsmod.geom_span([b])) + ROAD_LIFT))
         if not cands:
             return
         zc = self._under_ground(lines, [ground[g][1:3] for g in gids], cands)
@@ -2072,7 +2085,26 @@ class _Planner:
         lidar = UNDER_LIDAR_ON and not coarse and dem is not None and hasattr(dem, "coarse_at")
         requirements, xs_floor = [], []
         floor = seatiles.SEA_E + UNDER_SEA_M
-        for (i, sc, top), deck, z, (bi, pt) in zip(cands, decks, zc, cand_xs):
+        for (i, sc, top), deck, z, (bi, pt), top_cw in zip(cands, decks, zc, cand_xs, cand_cw):
+            if top_cw is not None and _cw.family(ground[gids[i]][3]) is not None:
+                continue                        # (a carriageway under a carriageway's deck: solved together)
+            if top_cw is not None:
+                # (a carriageway's deck, its height solved: the road under at its trusted height (beside the deck's
+                # embankment, not lidar's fill under it), lower only where the deck needs it)
+                u = _xs.dir_at(lines[i], pt)
+                tl = _xs.trusted_under(pt, u, 8.0, lambda p_: self._z_raw(p_))
+                tl = z if tl is None else min(tl, z)
+                target = max(min(tl, top_cw), z - UNDER_MAX_DROP_M)
+                if UNDER_SEA_ON and z >= floor:
+                    target = max(target, floor)
+                if os.environ.get("BNE_CW_DEBUG"):
+                    log.debug("grading: CWDIP at %s: road %.1f trusted %.1f deck %.1f -> %.1f", np.round(pt), z, tl,
+                              deck, target)
+                if target < z - 0.1:
+                    requirements.append((i, sc, z - target))
+                    xs_floor.append((np.asarray(pt, f64), target, _road_fids(i, lines, [ground[g][3] for g in gids],
+                                                                            gids), 8.0 + _xs.UNDER_GAP_M))
+                continue
             sol = self._xsolve(spans[bi][0]) if XS_ON and not rail_span[bi] else None
             if sol is not None and sol["cross"]:
                 # (crossings.ON: the road's target from the solve: its trusted height, less its share of the
@@ -2192,9 +2224,10 @@ class _Planner:
             return got
         c = self._cell_enu(k)
         out, seen = [], set()
-        items = [(ln, False, cls) for ln, _h, cls in c["ground"]]
-        items += [(ln, True, cls) for ln, cls in zip(c["bridges"], c.get("bridge_cls", [None] * len(c["bridges"])))]
-        for ln, br, cls in items:
+        items = [(ln, False, cls, gid[0]) for (ln, _h, cls), gid in zip(c["ground"], c["ground_ids"])]
+        items += [(ln, True, cls, fid) for ln, cls, fid in zip(c["bridges"], c.get("bridge_cls", [None] * len(c["bridges"])),
+                                                               c.get("bridge_ids", [None] * len(c["bridges"])))]
+        for ln, br, cls, fid in items:
             if _cw.family(cls) is None or len(ln) < 2:
                 continue
             ln = np.asarray(ln, np.float64)[:, :2]
@@ -2203,187 +2236,283 @@ class _Planner:
             if key in seen:
                 continue
             seen.add(key)
-            out.append((key, ln, br, str(cls)))
+            out.append((key, ln, br, str(cls), fid))
         with self.lock:
             if len(memo) > 512:
                 memo.clear()
             memo[sk] = out
         return out
 
-    def _cw_parts_at(self, p):
-        """The family parts with an end within carriageways.TOUCH_M of point p (from p's cell)."""
-        la, lo, _ = self.frame.enu_to_geodetic(np.array([p[0]]), np.array([p[1]]), 0.0)
-        k = mapcells.cell_of(float(la[0]), float(lo[0]))
-        out = []
-        for part in self._cw_cell_parts(k):
-            ln = part[1]
-            if min(np.hypot(*(ln[0] - p)), np.hypot(*(ln[-1] - p))) <= _cw.TOUCH_M:
-                out.append(part)
-        return out
+    def _z_raw(self, p):
+        """The raw elevation at points p (n, 2) of this frame."""
+        p = np.asarray(p, np.float64).reshape(-1, 2)
+        a, b, _ = self.frame.enu_to_geodetic(p[:, 0], p[:, 1], 0.0)
+        return np.asarray(self.elev(np.asarray(a, np.float64), np.asarray(b, np.float64)), np.float64).ravel()
 
-    def _cw_part_of(self, line):
-        """The family part (key, line, is_bridge, cls) a line (k, 2) is, or lies on (a plan's piece of it), or None."""
-        line = np.asarray(line, np.float64)[:, :2]
-        mid = line[len(line) // 2]
-        la, lo, _ = self.frame.enu_to_geodetic(np.array([mid[0]]), np.array([mid[1]]), 0.0)
-        best = None
-        for part in self._cw_cell_parts(mapcells.cell_of(float(la[0]), float(lo[0]))):
-            d = _seg_dist(part[1], mid)
-            if d <= 1.0 and (best is None or d < best[0]):
-                best = (d, part)
-        return None if best is None else best[1]
-
-    def _cw_chain(self, part):
-        """The chain of a family part: (parts [(key, line, is_bridge, cls)], order [(index, reversed)]), canonical
-        (the same whichever part it is reached from), cached by its parts."""
-        idx = self.__dict__.setdefault("_cw_index", {})
+    def _cw_region(self, home):
+        """Cell home's carriageways: the family parts within CW_MARGIN_M of it (from every cell there, each once), their
+        chains (carriageways.chains) and those solved together (_cw_solve): {"parts": [...], "chains": [...],
+        "prof": {part key: (chain samples xy, z)}}, cached. Every road and deck is answered by the region of the cell
+        holding its middle, so every cell and process asking gets the same heights."""
+        memo = self.__dict__.setdefault("_cw_regions", {})
+        hk = str(home)
         with self.lock:
-            got = idx.get(part[0])
+            got = memo.get(hk)
         if got is not None:
             return got
-        seq = [(part, False)]
-        keys = {part[0]}
-        total = float(np.hypot(*np.diff(part[1], axis=0).T).sum())
-        for forward in (True, False):
-            cur, rev = part, False
-            while total < CW_MAX_M:
-                ln = cur[1][::-1] if rev else cur[1]
-                e = ln[-1] if forward else ln[0]
-                at = [q for q in self._cw_parts_at(e)]
-                if len(at) != 2:
-                    break
-                nxt = at[0] if at[1][0] == cur[0] else at[1]
-                if nxt[0] in keys or nxt[0] == cur[0]:
-                    break
-                starts = np.hypot(*(nxt[1][0] - e)) <= _cw.TOUCH_M
-                nrev = (not starts) if forward else starts
-                keys.add(nxt[0])
-                total += float(np.hypot(*np.diff(nxt[1], axis=0).T).sum())
-                if forward:
-                    seq.append((nxt, nrev))
-                else:
-                    seq.insert(0, (nxt, nrev))
-                cur, rev = nxt, nrev
-        if str(seq[0][0][0]) > str(seq[-1][0][0]):          # (one direction whichever part it was reached from)
-            seq = [(p_, not r) for p_, r in seq[::-1]]
-        chain = ([p_ for p_, _r in seq], [(i, r) for i, (_p, r) in enumerate(seq)])
-        with self.lock:
-            for p_ in chain[0]:
-                idx[p_[0]] = chain
-        return chain
-
-    def _cw_profile(self, chain, others=None):
-        """(samples xy (m, 2), z (m,)) of a chain's profile (carriageways.profile), cached. others: the round (0: alone;
-        n: bounded by the other chains crossing it as they are in round n - 1; carriageways.LEVELS by default), so no
-        chain waits on another and every cell gets the same."""
-        others = _cw.LEVELS if others is None else int(others)
-        ck = (tuple(p_[0] for p_ in chain[0]), others)
-        memo = self.__dict__.setdefault("_cw_profiles", {})
-        with self.lock:
-            got = memo.get(ck)
-        if got is not None:
-            return got
+        f64 = np.float64
+        lon0, lat0, lon1, lat1 = (float(v) for v in home.bounds())
+        ce, cn, _ = self.frame.geodetic_to_enu(np.array([lat0, lat0, lat1, lat1]), np.array([lon0, lon1, lon0, lon1]),
+                                               0.0)
+        box_lo = np.array([np.min(ce), np.min(cn)]) - CW_MARGIN_M
+        box_hi = np.array([np.max(ce), np.max(cn)]) + CW_MARGIN_M
+        pad = CW_MARGIN_M / 111320.0
+        mid_la = (lat0 + lat1) / 2
+        keys = sorted(set(mapcells.cells_for_bbox(lat0 - pad, lon0 - pad / max(0.05, math.cos(math.radians(mid_la))),
+                                                  lat1 + pad, lon1 + pad / max(0.05, math.cos(math.radians(mid_la))))),
+                      key=str)
+        parts, seen = [], set()
         try:
-            got = self._cw_profile_calc(chain, others)
+            cell_parts = [self._cw_cell_parts(k) for k in keys]
+        except Exception as e:      # (a cell that cannot be read: no carriageways here, the rules as before)
+            log.debug("grading: carriageways of %s: %s: %s", hk, type(e).__name__, e)
+            return {"parts": [], "prof": {}}
+        for cp in cell_parts:
+            for q in cp:
+                if q[0] in seen:
+                    continue
+                if ((q[1] >= box_lo) & (q[1] <= box_hi)).all(1).any():
+                    seen.add(q[0])
+                    parts.append(q)
+        parts.sort(key=lambda q: str(q[0]))
+        chains = []
+        for seq in _cw.chains(parts):
+            chains.append(([parts[i] for i, _r in seq], [(n, r) for n, (_i, r) in enumerate(seq)]))
+        chains = [ch for ch in chains if any(p_[2] for p_ in ch[0]) or len(ch[0]) > 0]
+        prof = {}
+        try:
+            if chains:
+                prof = self._cw_cluster_solve(chains)
         except Exception as e:      # the rules as before rather than no grading
-            log.debug("grading: carriageway profile: %s: %s", type(e).__name__, e)
-            got = None
+            log.debug("grading: carriageways of %s: %s: %s", hk, type(e).__name__, e)
+            prof = {}
+        got = {"parts": parts, "prof": prof}
         with self.lock:
-            if len(memo) > 2048:
+            if len(memo) > 64:
                 memo.clear()
-            memo[ck] = got
+            memo[hk] = got
         return got
 
-    def _cw_profile_calc(self, chain, others):
+    def _cw_cluster_solve(self, chains):
         f64 = np.float64
-        parts, order = chain
-        if not any(p_[2] for p_ in parts):
-            return None                 # (no bridge: its plans as they are)
-        xy, s, pi, br, fe = _cw.sample(parts, order)
-        la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
-        raw = np.asarray(self.elev(np.asarray(la, f64), np.asarray(lo, f64)), f64).ravel()
-        g = ~br
-        if g.sum() < 2:
-            return None
-        t = np.interp(s, s[g], raw[g])                  # (the ground across the bridges, for the filters)
-        t = smooth_profile(median_profile(t, _cw.STEP_M, MEDIAN_M), _cw.STEP_M, SIGMA_MAJOR_M)
-        w = _cw.weights(br, fe)
-        lo_b = np.full(len(s), -np.inf)
-        hi_b = np.full(len(s), np.inf)
-        pad = 60.0 / 111320.0
+        data, samples = [], []
+        for ch in chains:
+            parts, order = ch
+            xy, s, pi, br, fe = _cw.sample(parts, order)
+            la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+            raw = np.asarray(self.elev(np.asarray(la, f64), np.asarray(lo, f64)), f64).ravel()
+            ok = np.isfinite(raw)
+            if not ok.any():
+                raw = np.zeros(len(raw))
+                ok[:] = True
+            elif not ok.all():                          # (no elevation there: the nearest that is)
+                raw = np.interp(s, s[ok], raw[ok])
+            g = ~br
+            if g.sum() >= 2:
+                t = np.interp(s, s[g], raw[g])          # (the ground across the bridges, for the filters)
+                t = smooth_profile(median_profile(t, _cw.STEP_M, MEDIAN_M), _cw.STEP_M, SIGMA_MAJOR_M)
+            else:
+                t = raw.copy()
+            w = _cw.weights(br, fe)
+            if g.sum() < 2:
+                w = np.where(np.arange(len(w)) < 0, 0.0, 1e-3)      # (all bridge: held lightly to the ground)
+            # the steepest of its parts' classes' limits (a chain is of one family; a link's limits are looser)
+            gr = max(_cw.limits(p_[3])[0] for p_ in parts)
+            K = min(_cw.limits(p_[3])[1] for p_ in parts)
+            data.append(dict(t=t, w=w, grade=gr, K=K, lo=np.full(len(s), -np.inf), hi=np.full(len(s), np.inf)))
+            samples.append((xy, s, pi, br, raw))
+        # bounds: tracks under its decks; other decks (not of the family) over its roads
+        allpts = np.concatenate([x[0] for x in samples])
+        la, lo, _ = self.frame.enu_to_geodetic(allpts[:, 0], allpts[:, 1], 0.0)
+        pad = 40.0 / 111320.0
         keys = sorted(set(mapcells.cells_for_points(np.asarray(la, f64), np.asarray(lo, f64), pad,
                                                     pad / max(0.05, math.cos(math.radians(float(np.mean(la))))))),
                       key=str)
         cs = [self._cell_enu(k) for k in keys]
-        mine = {p_[0] for p_ in parts}
-
-        def at_samples(points, which):
-            """Sample indices (of the parts which) nearest each point."""
-            cand = np.flatnonzero(which)
-            if not len(cand):
-                return []
-            return [int(cand[np.argmin(np.hypot(*(xy[cand] - q).T))]) for q in points]
-        # tracks under its bridges: never give way
         rails = [np.asarray(r, f64)[:, :2] for c in cs for r in c.get("rail_ground", ()) if len(r) >= 2]
-        for i, (part, rev) in enumerate(zip(parts, [r for _i, r in order])):
-            if not part[2]:
-                continue
-            clear = roadsmod.deck_road_clear(roadsmod.deck_depth(roadsmod.geom_span([part[1]]))) + ROAD_LIFT
-            if rails:
-                for c in roadsmod._crossings([part[1]], rails):
-                    q = np.asarray(c[2], f64)
-                    zr = float(np.asarray(self.elev(*[np.asarray(v, f64) for v in
-                                                      self.frame.enu_to_geodetic(np.array([q[0]]), np.array([q[1]]),
-                                                                                 0.0)[:2]]), f64).ravel()[0])
-                    for j in at_samples([q], pi == i):
-                        lo_b[j] = max(lo_b[j], zr + clear)
-        if others:
-            # the other carriageways crossing it: the one on a bridge over the other (their profiles without bounds)
-            other = []
-            for k in keys:
-                for part in self._cw_cell_parts(k):
-                    if part[0] not in mine:
-                        other.append(part)
-            seen = set()
-            for part in other:
-                if part[0] in seen:
-                    continue
-                seen.add(part[0])
-                for i, mp in enumerate(parts):
-                    if mp[2] == part[2]:
-                        continue                # (both on the ground: a junction; both bridges: left to the decks)
-                    for c in roadsmod._crossings([mp[1]], [part[1]]):
-                        q = np.asarray(c[2], f64)
-                        och = self._cw_chain(part)
-                        op = self._cw_profile(och, others - 1)
-                        if op is None:
-                            oz = float(np.asarray(self.elev(*[np.asarray(v, f64) for v in self.frame.enu_to_geodetic(
-                                np.array([q[0]]), np.array([q[1]]), 0.0)[:2]]), f64).ravel()[0])
-                        else:
-                            oxy, ozz = op
-                            oz = float(ozz[int(np.argmin(np.hypot(*(oxy - q).T)))])
-                        deck_part = mp if mp[2] else part
-                        clear = roadsmod.deck_road_clear(roadsmod.deck_depth(roadsmod.geom_span([deck_part[1]]))) \
-                            + ROAD_LIFT
-                        for j in at_samples([q], pi == i):
-                            if mp[2]:
-                                lo_b[j] = max(lo_b[j], oz + clear)       # (ours over theirs)
-                            else:
-                                hi_b[j] = min(hi_b[j], oz - clear)       # (theirs over ours)
-        # (pushed down under another's deck MAX_DIG_M at most: that deck rises for the rest)
-        hi_b = np.where(np.isfinite(hi_b), np.maximum(hi_b, t - _cw.MAX_DIG_M), hi_b)
-        z = _cw.profile(t, w, lo_b, hi_b)
-        log.debug("grading: carriageway of %d parts, %.0f m: %d bounds, moved %.1f..%.1f m from the ground",
-                  len(parts), s[-1], int(np.isfinite(lo_b).sum() + np.isfinite(hi_b).sum()),
-                  float(np.min((z - t)[g])), float(np.max((z - t)[g])))
-        return xy, z
+        fam_keys = {p_[0] for ch in chains for p_ in ch[0]}
+        nonfam = []
+        for c in cs:
+            for line, bc in zip(c["bridges"], c.get("bridge_cls", [None] * len(c["bridges"]))):
+                if bc is not None and _cw.family(bc) is None and len(line) >= 2:
+                    nonfam.append(np.asarray(line, f64)[:, :2])
 
-    def _cw_z_at(self, line, pts):
-        """Heights of points pts (n, 2) on the family part line from its carriageway's profile, or None."""
-        part = self._cw_part_of(line)
-        if part is None:
+        def zraw(q):
+            a, b_, _ = self.frame.enu_to_geodetic(np.array([q[0]]), np.array([q[1]]), 0.0)
+            return float(np.asarray(self.elev(np.asarray(a, f64), np.asarray(b_, f64)), f64).ravel()[0])
+
+        def zat(p):
+            p = np.asarray(p, f64).reshape(-1, 2)
+            a, b_, _ = self.frame.enu_to_geodetic(p[:, 0], p[:, 1], 0.0)
+            return np.asarray(self.elev(np.asarray(a, f64), np.asarray(b_, f64)), f64).ravel()
+        # the other roads on the ground (under the decks: they dip to clear them, except on low ground, where the
+        # deck rises instead: a dug road there is under the water table, Wezep's street under the A28)
+        streets = [(np.asarray(line, f64)[:, :2], float(half)) for c in cs for line, half, gc in c["ground"]
+                   if _cw.family(gc) is None and gc not in _xs.PATHS and gc not in UNGRADED and len(line) >= 2]
+
+        def nearest(n, part_i, q):
+            xy, s, pi, br, raw = samples[n]
+            cand = np.flatnonzero(pi == part_i)
+            return int(cand[np.argmin(np.hypot(*(xy[cand] - q).T))])
+        for n, ch in enumerate(chains):
+            parts = ch[0]
+            for i, p_ in enumerate(parts):
+                clear = CW_HEADROOM_M + roadsmod.deck_depth(roadsmod.geom_span([p_[1]])) + ROAD_LIFT
+                if p_[2] and rails:
+                    for c in roadsmod._crossings([p_[1]], rails):
+                        j = nearest(n, i, np.asarray(c[2], f64))
+                        data[n]["lo"][j] = max(data[n]["lo"][j], zraw(c[2]) + clear)
+                if p_[2] and streets:
+                    for c in roadsmod._crossings([p_[1]], [st[0] for st in streets]):
+                        L = float(np.hypot(*np.diff(p_[1], axis=0).T).sum())
+                        if c[1] < APPROACH_MIN_CROSS_M or c[1] > L - APPROACH_MIN_CROSS_M:
+                            continue
+                        q = np.asarray(c[2], f64)
+                        sl = min(streets, key=lambda st: _seg_dist(st[0], q))[0]
+                        tl = _xs.trusted_under(q, _xs.dir_at(sl, q), 8.0, zat)
+                        if tl is None or tl >= seatiles.SEA_E + _xs.LOW_M:
+                            continue
+                        j = nearest(n, i, q)
+                        data[n]["lo"][j] = max(data[n]["lo"][j], tl + clear)
+                if not p_[2] and nonfam and CW_NONFAM_HI:
+                    for c in roadsmod._crossings(nonfam, [p_[1]]):
+                        b = nonfam[c[0]]
+                        L = float(np.hypot(*np.diff(b, axis=0).T).sum())
+                        if c[1] < APPROACH_MIN_CROSS_M or c[1] > L - APPROACH_MIN_CROSS_M:
+                            continue
+                        ze = np.array([zraw(b[0]) + self._end_raised(b[0]), zraw(b[-1]) + self._end_raised(b[-1])])
+                        deck = float(ze[0] + (ze[1] - ze[0]) * c[1] / max(L, 1e-9))
+                        bc = roadsmod.deck_road_clear(roadsmod.deck_depth(roadsmod.geom_span([b]))) + ROAD_LIFT
+                        j = nearest(n, i, np.asarray(c[2], f64))
+                        # (lowered under it CW_MAX_DIG_M at most: past that the deck is too low, as before)
+                        data[n]["hi"][j] = min(data[n]["hi"][j], max(deck - bc, data[n]["t"][j] - CW_MAX_DIG_M))
+        # the ground under any deck (and beside it, its abutments' fill) is not the road's: the elevation fills the gap
+        # under a bridge at about the deck's height (a freeway read 2 m up under each street bridge over it)
+        decks_all = [np.asarray(line, f64)[:, :2] for c in cs for line in c["bridges"] if len(line) >= 2]
+        if decks_all:
+            A = np.concatenate([d[:-1] for d in decks_all])
+            B = np.concatenate([d[1:] for d in decks_all])
+            AB = B - A
+            L2 = np.maximum((AB * AB).sum(1), 1e-12)
+            for n, (xy, s_, pi, br, raw) in enumerate(samples):
+                g_ = np.flatnonzero(~br)
+                if not len(g_):
+                    continue
+                lo_q, hi_q = xy[g_].min(0) - 30.0, xy[g_].max(0) + 30.0
+                near = np.flatnonzero(~((np.maximum(A, B) < lo_q).any(1) | (np.minimum(A, B) > hi_q).any(1)))
+                if not len(near):
+                    continue
+                q = xy[g_]
+                t_ = np.clip(((q[:, None, :] - A[near][None]) * AB[near][None]).sum(2) / L2[near][None], 0.0, 1.0)
+                d = np.hypot(*(q[:, None, :] - (A[near][None] + t_[..., None] * AB[near][None])).transpose(2, 0, 1)).min(1)
+                u = np.clip((d - CW_UNDER_M) / CW_UNDER_M, 0.0, 1.0)
+                data[n]["w"][g_] *= u * u * (3.0 - 2.0 * u)
+        # couplings: ends at a branch point equal; one carriageway over another
+        couplings = []
+        ends = []
+        for n, (xy, s, pi, br, raw) in enumerate(samples):
+            ends += [(n, 0, xy[0]), (n, len(xy) - 1, xy[-1])]
+        for a in range(len(ends)):
+            for b in range(a + 1, len(ends)):
+                na, ia, pa = ends[a]
+                nb, ib, pb = ends[b]
+                if na != nb and np.hypot(*(pa - pb)) <= _cw.TOUCH_M:
+                    couplings.append((na, ia, nb, ib, "eq", 0.0))
+        cross = []
+        boxes = [(x[0].min(0), x[0].max(0)) for x in samples]
+        for na in range(len(chains)):
+            for nb in range(na + 1, len(chains)):
+                if (boxes[na][1] < boxes[nb][0]).any() or (boxes[nb][1] < boxes[na][0]).any():
+                    continue
+                hits = roadsmod._crossings_by([p_[1] for p_ in chains[na][0]], [p_[1] for p_ in chains[nb][0]])
+                for ib, lst in enumerate(hits):
+                    pb = chains[nb][0][ib]
+                    for c in lst:
+                        ia = int(c[0])
+                        pa = chains[na][0][ia]
+                        if pa[2] == pb[2] and not pa[2]:
+                            continue            # (two roads on the ground: a junction, not a separation)
+                        q = np.asarray(c[2], f64)
+                        ua, ub = _xs.dir_at(pa[1], q), _xs.dir_at(pb[1], q)
+                        if abs(ua[0] * ub[1] - ua[1] * ub[0]) < CW_MIN_SIN:
+                            continue            # (lines lying along each other: a duplicate or a merge, no crossing)
+                        if True:
+                            if min(np.hypot(*(pa[1][0] - q)), np.hypot(*(pa[1][-1] - q)), np.hypot(*(pb[1][0] - q)),
+                                   np.hypot(*(pb[1][-1] - q))) < 2.0:
+                                continue        # (joined there)
+                            cross.append((na, ia, nb, ib, q))
+        if cross:
+            # who is over whom: the bridge over the ground; of two bridges, the higher in the solve without them
+            pre = _cw.solve(data, couplings)
+            for na, ia, nb, ib, q in cross:
+                pa, pb = chains[na][0][ia], chains[nb][0][ib]
+                ja, jb = nearest(na, ia, q), nearest(nb, ib, q)
+                if pa[2] and not pb[2]:
+                    up, lo_ = (na, ja, pa), (nb, jb)
+                elif pb[2] and not pa[2]:
+                    up, lo_ = (nb, jb, pb), (na, ja)
+                else:
+                    up, lo_ = ((na, ja, pa), (nb, jb)) if pre[na][ja] >= pre[nb][jb] else ((nb, jb, pb), (na, ja))
+                clear = CW_HEADROOM_M + roadsmod.deck_depth(roadsmod.geom_span([up[2][1]])) + ROAD_LIFT
+                couplings.append((up[0], up[1], lo_[0], lo_[1], "ge", clear))
+        zs = _cw.solve(data, couplings)
+        if os.environ.get("BNE_CW_DUMP"):
+            import pickle
+            with open(os.environ["BNE_CW_DUMP"] + f".{len(chains)}.{len(couplings)}.pkl", "wb") as fh:
+                pickle.dump(dict(data=data, couplings=couplings, zs=zs, samples=samples,
+                                 parts=[[(p_[0], p_[2], p_[3]) for p_ in ch[0]] for ch in chains]), fh)
+        out = {}
+        for n, ch in enumerate(chains):
+            for p_ in ch[0]:
+                out[p_[0]] = (samples[n][0], zs[n])
+        moved = [float(np.max(np.abs((zs[n] - d["t"])[~samples[n][3]]))) if (~samples[n][3]).any() else 0.0
+                 for n, d in enumerate(data)]
+        log.debug("grading: carriageway cluster of %d chains, %d couplings: moved at most %.1f m from the ground",
+                  len(chains), len(couplings), max(moved) if moved else 0.0)
+        if os.environ.get("BNE_CW_DEBUG") and moved:
+            n = int(np.argmax(moved))
+            xy, s_, pi, br, raw = samples[n]
+            d = np.where(~br, np.abs(zs[n] - data[n]["t"]), 0.0)
+            j = int(np.argmax(d))
+            log.debug("grading: CWDBG chain %d (%s) at %s: t %.1f z %.1f raw %.1f w %.2f; lo %s hi %s; parts %s",
+                      n, chains[n][0][0][3], np.round(xy[j]), data[n]["t"][j], zs[n][j], raw[j], data[n]["w"][j],
+                      np.round(data[n]["lo"][np.isfinite(data[n]["lo"])], 1)[:5],
+                      np.round(data[n]["hi"][np.isfinite(data[n]["hi"])], 1)[:5], [(p_[2], len(p_[1])) for p_ in chains[n][0]])
+        return out
+
+    def _cw_z_at(self, line, pts, fid=None):
+        """Heights of points pts (n, 2) on the family part line (of feature fid) from its carriageway's profile, or
+        None."""
+        line = np.asarray(line, np.float64)[:, :2]
+        mid = line[len(line) // 2]
+        la, lo, _ = self.frame.enu_to_geodetic(np.array([mid[0]]), np.array([mid[1]]), 0.0)
+        try:
+            reg = self._cw_region(mapcells.cell_of(float(la[0]), float(lo[0])))
+        except Exception as e:      # (the rules as before)
+            log.debug("grading: carriageway at %s: %s: %s", np.round(mid, 1), type(e).__name__, e)
             return None
-        prof = self._cw_profile(self._cw_chain(part))
+        best = None
+        for q in reg["parts"]:
+            if fid is not None and q[4] != fid:
+                continue
+            if (q[1].max(0) < mid - 2.0).any() or (q[1].min(0) > mid + 2.0).any():
+                continue
+            d = _seg_dist(q[1], mid)
+            if d <= 1.0 and (best is None or d < best[0]):
+                best = (d, q)
+        if best is None:
+            return None
+        prof = reg["prof"].get(best[1][0])
         if prof is None:
             return None
         xy, z = prof
@@ -2409,7 +2538,7 @@ class _Planner:
             xy = np.asarray(p.xy, np.float64)[:, :2]
             if len(xy) < 2:
                 continue
-            z = self._cw_z_at(xy, xy)
+            z = self._cw_z_at(xy, xy, str(fid).split(":")[0])
             if z is None:
                 continue
             np_ = Plan(p.xy, z, p.half, p.abut, p.cut, p.road_half)
@@ -2553,7 +2682,7 @@ class _Planner:
                         # (and the tracks on the ground: a road bridge's approaches rise over them as over a road,
                         # GitHub #324)
                         rail_g += [np.asarray(r, np.float64) for r in rings if len(r) >= 2]
-        bridges, ground_l, ends, end_of, bcls, ground_ids = [], [], [], [], [], []
+        bridges, ground_l, ends, end_of, bcls, ground_ids, bids = [], [], [], [], [], [], []
         items = sorted(parts.items())
         if items:               # (the frame's conversion once for every part: it is per call)
             allr = np.concatenate([ring for _k, (ring, _sp) in items])
@@ -2567,6 +2696,7 @@ class _Planner:
                 end_of += [len(bridges), len(bridges)]
                 ends += [line[0], line[-1]]
                 bridges.append(line)
+                bids.append(fid)
                 cls = getattr(sp, "cls", None)
                 bcls.append(cls + "_link" if cls is not None and _is_link(sp) else cls)
             else:
@@ -2581,7 +2711,8 @@ class _Planner:
             for ring, out_ in [(r, rail_xy) for r in rail] + [(r, rail_gxy) for r in rail_g]:
                 out_.append(rxy[k0:k0 + len(ring)])
                 k0 += len(ring)
-        return {"bridges": bridges, "bridge_cls": bcls, "ground": ground_l, "ground_ids": ground_ids, "end_of": end_of,
+        return {"bridges": bridges, "bridge_cls": bcls, "bridge_ids": bids, "ground": ground_l, "ground_ids": ground_ids,
+                "end_of": end_of,
                 "ends": np.asarray(ends, np.float64).reshape(-1, 2), "rail_bridges": rail_xy, "rail_ground": rail_gxy}
 
     def _ground_table(self, keys, cs):
@@ -3261,6 +3392,8 @@ class PlanStore:
 
     def __init__(self, mapdata, elev, widths=None):
         self.md, self.elev, self.widths = mapdata, elev, widths
+        global _ACTIVE_STORE
+        _ACTIVE_STORE = self
         self.wet = None
         self.dem = None
         self.shared = None
@@ -3306,6 +3439,36 @@ class PlanStore:
         for a, b in sorted({(int(a), int(b)) for a, b in zip(rx, ry)}):
             out.append((self.planner((a, b)), np.flatnonzero((rx == a) & (ry == b))))
         return out
+
+
+_ACTIVE_STORE = None    # the process's PlanStore (the last made): the carriageways' deck heights (_deck_z_hook)
+
+
+def _deck_z_hook(frame, lines, fids=None):
+    """roads.DECK_Z_HOOK: per deck line (frame ENU (k, 2+)), its heights (frame up m) from its carriageway's profile, or
+    None where it is not one's."""
+    store = _ACTIVE_STORE
+    if store is None:
+        return None
+    out = []
+    for n, ln in enumerate(lines):
+        fid = None if fids is None else str(fids[n])
+        ln = np.asarray(ln, np.float64)[:, :2]
+        la, lo, _ = frame.enu_to_geodetic(ln[:, 0], ln[:, 1], 0.0)
+        la, lo = np.asarray(la, np.float64), np.asarray(lo, np.float64)
+        pl, _idx = store.planners_of(la[len(la) // 2:len(la) // 2 + 1], lo[len(lo) // 2:len(lo) // 2 + 1])[0]
+        e, n, _ = pl.frame.geodetic_to_enu(la, lo, 0.0)
+        xy = np.stack([np.asarray(e, np.float64), np.asarray(n, np.float64)], axis=1)
+        z = pl._cw_z_at(xy, xy, fid)
+        if z is None:
+            out.append(None)
+            continue
+        out.append(np.asarray(frame.geodetic_to_enu(la, lo, np.asarray(z, np.float64))[2], np.float64))
+    return out if any(o is not None for o in out) else None
+
+
+if CW_ON:
+    roadsmod.DECK_Z_HOOK = _deck_z_hook
 
 
 PLANNERS_KEPT = 6               # planning regions a PlanStore keeps in memory (~30 km each)
