@@ -46,8 +46,11 @@ LOW_M = 10.0            # m above the sea: low ground ...
 LOW_COST = 2.0          # ... where lowering costs this much more
 PATHS = ("footway", "cycleway", "path", "pedestrian", "steps", "bridleway", "sidewalk", "crossing")
 # per metre: what raising a bridge's two approaches costs (their length is the lift over the ramp's grade, its width
-# the road's), and what lowering the road under costs (two ramps, the walls between)
-UP_COST = {"motorway": 4.0, "trunk": 3.5, "primary": 3.0, "secondary": 2.5, "tertiary": 2.0, "unclassified": 1.5,
+# the road's), and what lowering the road under costs (two ramps, the walls between). A motorway's or trunk's lift is a
+# long ramp on a fast road (at 4 its bridges over Perth's streets rose 2-4 m each, humps along the Mitchell Freeway
+# where a street dipping 1-2 m under it is all it took): it rises only over a street tied to its grid on low ground
+# (Wezep's: 3 x 2 junctions-share x 2 low = 12)
+UP_COST = {"motorway": 10.0, "trunk": 8.0, "primary": 3.0, "secondary": 2.5, "tertiary": 2.0, "unclassified": 1.5,
            "residential": 1.5, "living_street": 1.5, "service": 1.0, "track": 1.0}
 DOWN_COST = {"motorway": 8.0, "trunk": 6.0, "primary": 4.0, "secondary": 3.0, "tertiary": 2.5, "unclassified": 2.0,
              "residential": 2.0, "living_street": 2.0, "service": 1.0, "track": 1.0}
@@ -118,13 +121,19 @@ def trusted_under(p, u, half_over, z_at):
 
 
 def trusted_over(end, u_out, z_at):
-    """The trusted height of a bridge's end: the median of the ground along its road past the abutment (u_out, unit,
-    pointing away from the bridge). None without enough."""
-    pts = np.asarray(end, np.float64) + (OVER_GAP_M + STEP_M * np.arange(int(OVER_RUN_M / STEP_M) + 1))[:, None] \
-        * np.asarray(u_out, np.float64)
-    z = z_at(pts)
-    z = z[np.isfinite(z)]
-    return float(np.median(z)) if len(z) >= SIDE_MIN else None
+    """The trusted height of a bridge's end: the ground along its road past the abutment (u_out, unit, pointing away
+    from the bridge), its straight trend carried back to the abutment. An embankment past an end on its slope reads
+    level, so the end comes up to it; ground still rising away from the bridge reads as the end's own height, not as
+    the higher ground past it (Perth's Mitchell Freeway: the median of rising ground filled abutments 3-4 m over the
+    streets beside them, 2026-11-01). None without enough."""
+    d = OVER_GAP_M + STEP_M * np.arange(int(OVER_RUN_M / STEP_M) + 1)
+    pts = np.asarray(end, np.float64) + d[:, None] * np.asarray(u_out, np.float64)
+    z = np.asarray(z_at(pts), np.float64)
+    ok = np.isfinite(z)
+    if ok.sum() < SIDE_MIN:
+        return None
+    b, a = np.polyfit(d[ok], z[ok], 1)
+    return float(min(a, np.median(z[ok])))
 
 
 def end_dirs(line):

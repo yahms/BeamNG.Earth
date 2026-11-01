@@ -293,6 +293,7 @@ UNDER_ANY_ON = os.environ.get("BNE_UNDERPASS_ANY", "on") != "off"
 # ramps for those bridges (a motorway's too); the rules above decide for every other.
 import crossings as _xs
 XS_ON = _xs.ON
+XS_FIXED_GRADE = 0.03   # a solved motorway's or trunk's ramps rise at this (_lift_approaches)
 XS_FLOOR_M = 150.0      # m round a solved crossing no road is dug under its target (_lower_underpasses)
 ABUT_NEAR_M = 14.0          # m from the bridge end the road is checked ...
 ABUT_FAR_M = 40.0           # ... against its grade from ABUT_NEAR_M to this far
@@ -1925,8 +1926,11 @@ class _Planner:
                 # into its two carriageways past Wezep's A28 deck, 19 m off its abutment, held the ramp's 1:2 fill to
                 # 3.3 m of 4.7, its deck end 1 m under the ramp, a dip where the deck met it, the user 2026-11-01)
                 solved = len(got) > 6 and bool(got[5])
+                # (a motorway's or trunk's ramp at XS_FIXED_GRADE: a hump at 5 % on a freeway, Perth's Mitchell
+                # Freeway rising 3-4 m to each of its street bridges, the user 2026-11-01)
                 a = approach_add(p.xy, at_end, lift, p.half, others,
-                                 MEASURED_SIDE_RUN if measured or solved else SLOPE_RUN)
+                                 MEASURED_SIDE_RUN if measured or solved else SLOPE_RUN,
+                                 XS_FIXED_GRADE if solved and _never_raised(specs[i]) else None)
                 if a is not None:
                     add = a if add is None else np.maximum(add, a)
             if add is not None:
@@ -2478,6 +2482,12 @@ class _Planner:
         s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(bridge, axis=0).T))]
         clear = roadsmod.deck_road_clear(roadsmod.deck_depth(roadsmod.geom_span([bridge]))) + ROAD_LIFT
         low_ground = bool(np.min(base) < seatiles.SEA_E + xs.LOW_M)
+        fixed = str(cls) in APPROACH_SKIP
+        if fixed and not low_ground:
+            # (a motorway or trunk off low ground stays as the data has it, its ends too: the roads under it give way,
+            # as #126. Raised, Perth's Mitchell Freeway rose 1-4 m to each of its street bridges, humps along it where
+            # a street dipping 1-2 m under it was all it took, the user 2026-11-01)
+            base = g_end.copy()
         roads_ = [ln for ln, gc in zip(lines, classes) if gc not in xs.PATHS]
         deck, low, w_down, drop_max, pts = [], [], [], [], []
         floor = seatiles.SEA_E + UNDER_SEA_M
@@ -2500,6 +2510,8 @@ class _Planner:
             drop_max.append(dm)
             pts.append(pt)
         cap = xs.MAX_LIFT_FIXED_M if str(cls) in APPROACH_SKIP else min(xs.MAX_LIFT_M, APPROACH_MAX_LIFT)
+        if fixed and not low_ground:
+            cap = 0.0
         lift, drops = xs.solve(deck, low, clear, xs.up_cost(cls), np.array(w_down), cap, np.array(drop_max))
         out = {"ends": ends, "raise": base - g_end + lift, "lift": lift, "top": base + lift,
                "reach": half_over + xs.UNDER_GAP_M,
@@ -3482,7 +3494,7 @@ def under_dip(d, depth, room=(math.inf, math.inf)):
     return -depth * 0.5 * (1.0 + np.cos(math.pi * u))
 
 
-def approach_add(xy, at_end, lift, half, others=(), side_run=None):
+def approach_add(xy, at_end, lift, half, others=(), side_run=None, grade=None):
     """m to add to a road plan's vertices (xy (n, 2)) rising to `lift` at its first (at_end False) or last vertex (a
     bridge's abutment), falling off along the road (arc length) on a cosine ramp whose steepest grade is APPROACH_GRADE;
     at most what keeps the fill slope (side_run x the height out, SLOPE_RUN by default) clear of the other roads
@@ -3493,7 +3505,8 @@ def approach_add(xy, at_end, lift, half, others=(), side_run=None):
         return None
     s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
     d = (s[-1] - s) if at_end else s
-    run = float(np.clip(lift * math.pi / (2 * APPROACH_GRADE), APPROACH_MIN_RUN, APPROACH_MAX_RUN))
+    run = float(np.clip(lift * math.pi / (2 * (grade or APPROACH_GRADE)), APPROACH_MIN_RUN,
+                        APPROACH_MAX_RUN * (APPROACH_GRADE / grade if grade else 1.0)))
     u = np.clip(d / run, 0.0, 1.0)
     add = lift * 0.5 * (1.0 + np.cos(math.pi * u))
     on = add > 1e-3
