@@ -2115,6 +2115,10 @@ class _Planner:
                 # The road itself is held at its target across the fill (the dip, a depth from the ground at the
                 # crossing, left the fill's far shoulders standing), rising away at UNDER_GRADE past it.
                 xy = xys[n]
+                # (the floor: the lowest target near, not each in turn: a street under a motorway and its slip road
+                # side by side was held at the slip road's target, 1.3 m over the motorway's, and the motorway's deck
+                # humped over it, Perth's Mitchell Freeway at Roe Street, the user 2026-11-01)
+                low_t = np.full(len(z1), np.inf)
                 for q, t, qfids, reach in xs_floor:
                     dq = np.hypot(xy[:, 0] - q[0], xy[:, 1] - q[1])
                     if dq.min() > XS_FLOOR_M:
@@ -2123,7 +2127,8 @@ class _Planner:
                         # (and the parts continuing it, of its class: a dual carriageway's halves past the deck)
                         cap = t + np.maximum(dq - reach, 0.0) * UNDER_GRADE
                         z1 = np.where(dq <= XS_FLOOR_M, np.minimum(z1, np.maximum(cap, np.minimum(z0, t))), z1)
-                    z1 = np.where(dq <= XS_FLOOR_M, np.maximum(z1, np.minimum(z0, t)), z1)
+                    low_t = np.where(dq <= XS_FLOOR_M, np.minimum(low_t, t), low_t)
+                z1 = np.where(np.isfinite(low_t), np.maximum(z1, np.minimum(z0, low_t)), z1)
             if UNDER_SEA_ON:                    # (every point: a dip's flat and ramps, a joined road's share)
                 z1 = np.where(z0 >= UNDER_POLDER_M, np.maximum(z1, np.minimum(z0, floor)), z1)
             np_ = Plan(p.xy, z1, p.half, p.abut, p.cut, p.road_half)
@@ -2483,11 +2488,10 @@ class _Planner:
         clear = roadsmod.deck_road_clear(roadsmod.deck_depth(roadsmod.geom_span([bridge]))) + ROAD_LIFT
         low_ground = bool(np.min(base) < seatiles.SEA_E + xs.LOW_M)
         fixed = str(cls) in APPROACH_SKIP
-        if fixed and not low_ground:
-            # (a motorway or trunk off low ground stays as the data has it, its ends too: the roads under it give way,
-            # as #126. Raised, Perth's Mitchell Freeway rose 1-4 m to each of its street bridges, humps along it where
-            # a street dipping 1-2 m under it was all it took, the user 2026-11-01)
-            base = g_end.copy()
+        # (a motorway or trunk off low ground is not lifted: the roads under it give way, as #126. Lifted, Perth's
+        # Mitchell Freeway rose 1-4 m to each of its street bridges, humps along it where a street dipping 1-2 m under
+        # it was all it took. Its ends are still brought up to its road's trend past them: left on their embankments'
+        # slopes, the freeway dipped 1-2 m into each bridge and humped over the street, the user 2026-11-01)
         roads_ = [ln for ln, gc in zip(lines, classes) if gc not in xs.PATHS]
         deck, low, w_down, drop_max, pts = [], [], [], [], []
         floor = seatiles.SEA_E + UNDER_SEA_M

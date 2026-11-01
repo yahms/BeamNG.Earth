@@ -33,6 +33,7 @@ UNDER_RUN_M = 60.0      # ... and over this much further, on each side (lidar's 
                         # 35-45 m either side of it)
 OVER_GAP_M = 8.0        # m past an abutment the road over is first read ...
 OVER_RUN_M = 40.0       # ... and over this much further
+LEVEL_GRADE = 0.03      # its far half this level or more: an embankment top
 STEP_M = 4.0            # m between samples
 SIDE_MIN = 4            # samples a side needs to count
 MAX_LIFT_M = 10.0       # m a bridge's ends are raised at most (grading.APPROACH_MAX_LIFT) ...
@@ -132,6 +133,13 @@ def trusted_over(end, u_out, z_at):
     ok = np.isfinite(z)
     if ok.sum() < SIDE_MIN:
         return None
+    far = ok & (d >= d[0] + (d[-1] - d[0]) / 2)
+    if far.sum() >= 3:
+        bf, _af = np.polyfit(d[far], z[far], 1)
+        if abs(bf) <= LEVEL_GRADE:
+            # (level past the slope: an embankment's top, the end on its slope comes up to it. The Mitchell
+            # Freeway's bridge over Roe Street: its end 3 m down the slope, the fit through the slope read 1 m)
+            return float(np.median(z[far]))
     b, a = np.polyfit(d[ok], z[ok], 1)
     return float(min(a, np.median(z[ok])))
 
