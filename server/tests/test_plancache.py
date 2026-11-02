@@ -96,6 +96,47 @@ class PlanCacheTest(unittest.TestCase):
         self.assertEqual(got[0][0], ([], [], [], []))
         self.assertEqual(other.stats["waited"], 1)
 
+    def test_busy_while_a_live_process_plans_it(self):
+        c = plancache.PlanCache(self.dir, "s")
+        self.assertFalse(c.busy(KEY), "nobody planning")
+        self.assertEqual(c.claim(KEY), (None, True))
+        self.assertTrue(c.busy(KEY), "held")
+        c.store(KEY, [], [], [], [])
+        self.assertFalse(c.busy(KEY), "planned: in the cache")
+        c.release(KEY)
+        other = (14, 4001, 6000)
+        with open(c._path(other) + ".lock", "w") as fh:
+            fh.write("1 0 999999999")       # (a holder that is gone)
+        self.assertFalse(c.busy(other), "its process gone: not busy")
+
+    def test_plan_missing_plans_another_cell_while_one_is_planned_elsewhere(self):
+        """A process needing cells one of which another process plans plans the others meanwhile, and only then
+        waits (the High Five's first block: a dozen cells planned one after another by the process holding their
+        locks, 2026-11-02)."""
+        import mapcells
+        f = features([[(-300, 20), (300, 20)], [(0, -300), (0, 300)]], ["residential", "secondary"])
+        g = self.grader(FakeMD(f))
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([0.0]), np.array([0.0]), 0.0)
+        a = mapcells.cell_of(float(la[0]), float(lo[0]))
+        b = mapcells.CellKey(a.z, a.x + 1, a.y)
+        held = plancache.for_grader(self.dir, self.grader(FakeMD(f), shared=False), None, None)
+        self.assertEqual(held.claim(tuple(a)), (None, True))     # (another process planning a)
+        pl = g.store.planner_of_cell(a)
+        patch = mock.patch.object(grading, "PLAN_THREADS", 1)     # (more cells than threads: a dozen and 4)
+        patch.start()
+        self.addCleanup(patch.stop)
+        t = threading.Thread(target=lambda: pl._plan_missing([a, b]))
+        t.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not os.path.exists(g.shared._path(tuple(b))):
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(g.shared._path(tuple(b))), "b planned while a was busy elsewhere")
+        self.assertTrue(t.is_alive(), "still waiting for a")
+        held.store(tuple(a), [], [], [], [])
+        held.release(tuple(a))
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
     def test_does_not_wait_behind_a_less_favoured_planner(self):
         c = plancache.PlanCache(self.dir, "s")
         with mock.patch.object(xproc, "PRIORITY", 5):

@@ -74,6 +74,10 @@ SIDEWALK_MARGIN_M = 0.5     # m of flat ground beyond a sidewalk (roads.SIDEWALK
 LONG_PART_M = 3000.0        # a road part longer than this is planned per cell, only within CLIP_MARGIN_M of the cell
 CLIP_MARGIN_M = 400.0
 PLAN_THREADS = 4            # cells planned at once (_plan_missing)
+# cells one process plans at once when the plans are shared between processes (_plan_missing): its threads share one
+# core, the rest are left to the other processes
+PLAN_CLAIMS = max(1, int(os.environ.get("BNE_PLAN_CLAIMS", "2")))
+_PLAN_CLAIMS = threading.BoundedSemaphore(PLAN_CLAIMS)
 PLAN_SETS_MAX = 16          # cell sets whose merged plans are kept (Grader._plan_set; ~1 MB each in a town)
 SPREAD_CELLS = 16           # plans(): more map cells in the points' bbox: only the cells around the points
 T_MIN, T_MAX = 5.0, 12.0    # m, transition back to the natural ground (5: roads close together meet gently)
@@ -2125,8 +2129,47 @@ class _Planner:
                 with dem.urgent():
                     return self._cell_plans(k)
             return self._cell_plans(k)
-        with ThreadPoolExecutor(min(len(missing), PLAN_THREADS), thread_name_prefix="plans") as ex:
-            list(ex.map(one, missing))
+        shared = self.shared
+        if shared is None or not hasattr(shared, "busy"):
+            with ThreadPoolExecutor(min(len(missing), PLAN_THREADS), thread_name_prefix="plans") as ex:
+                list(ex.map(one, missing))
+            return
+        # Shared with the server's other processes (plancache): each thread takes the next cell nobody is planning, and
+        # waits for one another process plans only when none is left; a process plans PLAN_CLAIMS cells at a time
+        # (its threads share one core: a dozen cells claimed at once were planned one after another while the other
+        # processes waited on their locks, the High Five's first block graded in 170 s, 2026-11-02).
+        todo = list(missing)
+        qlock = threading.Lock()
+
+        def next_cell():
+            with qlock:
+                for i, k in enumerate(todo):
+                    with self.lock:
+                        done = k in self.cells
+                    if done:
+                        continue
+                    if not shared.busy(k):
+                        del todo[i]
+                        return k, False
+                return (todo.pop(0), True) if todo else (None, False)
+
+        def worker():
+            while True:
+                k, wait = next_cell()
+                if k is None:
+                    return
+                if wait:
+                    one(k)          # (every cell left is another's: wait for it, as before)
+                else:
+                    with _PLAN_CLAIMS:
+                        if shared.busy(k):      # (taken while this thread waited its turn: another cell first)
+                            with qlock:
+                                todo.append(k)
+                            continue
+                        one(k)
+        n = min(len(missing), PLAN_THREADS)
+        with ThreadPoolExecutor(n, thread_name_prefix="plans") as ex:
+            list(ex.map(lambda _i: worker(), range(n)))
 
     def plans(self, lat, lon, roads_only=False):
         """The Plans touching the points' area (each road once); roads_only: not the tunnels' (TUNNEL_TAG)."""

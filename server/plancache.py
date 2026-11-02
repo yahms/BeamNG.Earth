@@ -198,6 +198,18 @@ class PlanCache:
     def release(self, key):
         xproc.release(self._path(key) + ".lock")
 
+    def busy(self, key):
+        """Whether cell key is being planned right now (its lock held by a live process, this one's other threads
+        included) and not in the cache yet: grading._plan_missing plans another cell meanwhile."""
+        p = self._path(key)
+        lock = p + ".lock"
+        if os.path.exists(p) or not os.path.exists(lock):
+            return False
+        h = xproc._holder(lock)
+        if h is None:
+            return True                 # (being written: just taken)
+        return xproc.alive(h[2])
+
 
 def _newest(d, depth=2):
     """The newest mtime of folder d and the folders up to depth levels below it (a run's anchor and signature
