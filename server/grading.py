@@ -3447,7 +3447,15 @@ class _Planner:
                     parts.append(q)
         parts.sort(key=lambda q: str(q[0]))
         chains = []
-        for seq in _cw.chains(parts):
+        stops = None
+        if _cw.THROUGH_ON:
+            # (a street's ends: a junction where one meets the family's roads at grade is no through junction, the
+            # chain ends there as before: run on through Newcastle Street, Charles Street's profile was kinked 12 %
+            # by the street's junction, 2026-11-10)
+            sl = [np.asarray(line, f64)[[0, -1], :2] for k in keys for line, _h, gc in self._cell_enu(k)["ground"]
+                  if _cw.family(gc) is None and gc not in _xs.PATHS and len(line) >= 2]
+            stops = np.concatenate(sl) if sl else np.zeros((0, 2), f64)
+        for seq in _cw.chains(parts, through=_cw.THROUGH_ON, stops=stops):
             chains.append(([parts[i] for i, _r in seq], [(n, r) for n, (_i, r) in enumerate(seq)]))
         chains = [ch for ch in chains if any(p_[2] for p_ in ch[0]) or len(ch[0]) > 0]
         prof = {}
@@ -3700,7 +3708,10 @@ class _Planner:
             for a, b in zip(*np.nonzero(ok)):
                 couplings.append((int(e_n[a]), int(e_i[a]), int(e_n[b]), int(e_i[b]), "eq", 0.0))
         # (an end meeting the inside of another chain: a slip road at its overpass road's node, solved with it)
-        joined = _cw.branch_ties([x[0] for x in samples], [x[3] for x in samples])
+        joints = []         # (per chain where its parts join: a junction it runs on through, chains(through=True))
+        for parts_, order_ in chains:
+            joints.append([p_[1][-1 if r_ else 0, :2] for p_, (_n, r_) in list(zip(parts_, order_))[1:]])
+        joined = _cw.branch_ties([x[0] for x in samples], [x[3] for x in samples], joints=joints)
         couplings += [(na, ia, nb, jb, "eq", 0.0) for na, ia, nb, jb in joined]
         cross = []
         b_lo = np.array([x[0].min(0) for x in samples], f64).reshape(-1, 2)

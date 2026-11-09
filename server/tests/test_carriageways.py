@@ -41,6 +41,23 @@ class ProfileTest(unittest.TestCase):
              ("e", np.array([[300, 0], [400, 0.]]))]
         self.assertEqual(cw.chains(P), [[(0, False), (1, False), (2, True)], [(3, False)], [(4, False)]])
 
+    def test_chains_run_on_through_a_motorway_junction(self):
+        # a slip road (d) leaves a motorway (c, e) at (300, 0): the motorway runs on through as one chain; the slip road
+        # is a chain of its own, and a street's end at the node (stops) keeps the junction a chain end
+        P = [("a", np.array([[0, 0], [100, 0.]]), False, "motorway"),
+             ("b", np.array([[100, 0], [160, 0.]]), False, "motorway"),
+             ("c", np.array([[300, 0], [160, 0.]]), False, "motorway"),
+             ("d", np.array([[300, 0], [400, 50.]]), False, "motorway_link"),
+             ("e", np.array([[300, 0], [400, 0.]]), False, "motorway")]
+        self.assertEqual(cw.chains(P, through=True), [[(0, False), (1, False), (2, True), (4, False)], [(3, False)]])
+        self.assertEqual(cw.chains(P, through=True, stops=np.array([[300.5, 0.]])),
+                         [[(0, False), (1, False), (2, True)], [(3, False)], [(4, False)]])
+        # two slip roads merging into one: the straighter runs on into it
+        Q = [("f", np.array([[0, 0], [100, 0.]]), False, "motorway_link"),
+             ("g", np.array([[0, -40], [100, 0.]]), False, "motorway_link"),
+             ("h", np.array([[100, 0], [200, 0.]]), False, "motorway_link")]
+        self.assertEqual(cw.chains(Q, through=True), [[(0, False), (2, False)], [(1, False)]])
+
 
 if __name__ == "__main__":
     unittest.main()

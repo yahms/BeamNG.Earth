@@ -197,7 +197,7 @@ def report(cache, run, bbox, fids=(), as_json=None, timing=None):
             continue
         for a, b in ((0, 1), (-1, -2)):
             run_ = max(float(np.hypot(*(xy[a] - xy[b]))), 1e-6)
-            ends.append((fid, c, xy[a], float(z[a]), float(z[a] - z[b]) / run_))
+            ends.append((fid, c, xy[a], float(z[a]), float(z[a] - z[b]) / run_, (xy[b] - xy[a]) / run_))
     joins = []
     P = np.array([e_[2] for e_ in ends]) if ends else np.zeros((0, 2))
     for i in range(len(ends)):
@@ -209,6 +209,8 @@ def report(cache, run, bbox, fids=(), as_json=None, timing=None):
             if A[0] == B[0]:
                 continue
             dz, br = A[3] - B[3], (A[4] + B[4]) * 100
+            if float(np.dot(A[5], B[5])) > -0.87:
+                br = 0.0        # (two roads that do not continue each other, a merge's two branches: no grade to keep)
             if abs(dz) > STEP_M or abs(br) > BREAK_PCT:
                 joins.append((A, B, dz, br))
     joins.sort(key=lambda j_: -max(abs(j_[2]) / STEP_M, abs(j_[3]) / BREAK_PCT))

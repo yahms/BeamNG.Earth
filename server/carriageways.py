@@ -104,10 +104,61 @@ def sample(parts, chain, step=STEP_M):
     return xy, s, pi, br, from_end
 
 
-def chains(parts, tol=TOUCH_M):
+THROUGH_ON = os.environ.get("BNE_CW_THROUGH", "on") != "off"
+THROUGH_COS = math.cos(math.radians(150.0))     # two ends at a junction continue each other: their ways out this opposed
+THROUGH_FAMILY = "motorway"     # (a trunk's junctions are mostly at grade, with streets: Charles Street's kinked)
+THROUGH_LOOK_M = 15.0   # m: an end's way out, from its node to the point this far along its part
+
+
+def _way_out(line, at_start, look=THROUGH_LOOK_M):
+    """Unit vector from a part's end (its start or its end) to the point look m along it."""
+    q = line[:, :2] if at_start else line[::-1, :2]
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(q, axis=0).T))]
+    p = np.array([np.interp(min(look, s[-1]), s, q[:, 0]), np.interp(min(look, s[-1]), s, q[:, 1])])
+    d = p - q[0]
+    L = float(np.hypot(*d))
+    return d / L if L > 0 else np.zeros(2)
+
+
+def through_pairs(parts, nb, stops=None, tol=TOUCH_M):
+    """{end: end} at the junctions where three or more parts meet: the pairs that continue each other (their ways out
+    within 30 degrees of straight on, of the same class, the straightest first), so a carriageway runs on through
+    the junction where a slip road leaves or joins it, and two slip roads merging into one run on into it, as one
+    chain (its grade and curve held across the node). Ends are 2i (part i's start) and 2i + 1 (its end). stops (k, 2):
+    other roads' ends (a street meeting them at grade): no through pair at a junction within COUPLE_M of one."""
+    out = {}
+    cls = [str(p[3]) if len(p) > 3 else "" for p in parts]
+    keys = [str(p[0]) for p in parts]
+    done = set()
+    for e in range(len(nb)):
+        if len(nb[e]) < 2 or e in done:
+            continue
+        node = sorted({e, *nb[e]})
+        done.update(node)
+        if stops is not None and len(stops):
+            q = parts[e // 2][1][0 if e % 2 == 0 else -1, :2]
+            if float(np.min(np.hypot(*(np.asarray(stops, np.float64) - q).T))) <= COUPLE_M:
+                continue
+        way = {x: _way_out(parts[x // 2][1], x % 2 == 0) for x in node}
+        cand = []
+        for i, a in enumerate(node):
+            for b in node[i + 1:]:
+                if a // 2 == b // 2 or cls[a // 2] != cls[b // 2] or not cls[a // 2].startswith(THROUGH_FAMILY):
+                    continue
+                c = float(np.dot(way[a], way[b]))
+                if c <= THROUGH_COS:
+                    cand.append((c, min(keys[a // 2], keys[b // 2]), max(keys[a // 2], keys[b // 2]), a, b))
+        for _c, _ka, _kb, a, b in sorted(cand):
+            if a not in out and b not in out:
+                out[a], out[b] = b, a
+    return out
+
+
+def chains(parts, tol=TOUCH_M, through=False, stops=None):
     """parts: [(key, line (k, 2), ...)] (the family's parts in a region, each once). Returns the chains: [[(part index,
-    reversed)]], each a maximal run joined end to end through points where exactly two parts meet, ordered and
-    oriented canonically (from the end of its lowest-keyed end part). Pure."""
+    reversed)]], each a maximal run joined end to end through points where exactly two parts meet (and with through,
+    through junctions on the pairs of through_pairs, none at stops), ordered and oriented canonically (from the end of its
+    lowest-keyed end part). Pure."""
     n = len(parts)
     if not n:
         return []
@@ -125,6 +176,14 @@ def chains(parts, tol=TOUCH_M):
                 nb[f].append(int(e))
             b_i += 1
     keys = [str(p[0]) for p in parts]
+    thru = through_pairs(parts, nb, stops) if through else {}
+
+    def onward(e):
+        """The end met walking out of end e, or None (a chain ends there)."""
+        if len(nb[e]) == 1:
+            return nb[e][0]
+        return thru.get(e)
+
     used = np.zeros(n, bool)
     out = []
     for i in sorted(range(n), key=lambda i: keys[i]):
@@ -134,9 +193,9 @@ def chains(parts, tol=TOUCH_M):
         j, rev, seen = i, False, {i}
         while True:
             e = 2 * j + (1 if rev else 0)               # the end walked in from
-            if len(nb[e]) != 1:
+            k = onward(e)
+            if k is None:
                 break
-            k = nb[e][0]
             jj = k // 2
             if jj in seen:
                 break
@@ -147,9 +206,9 @@ def chains(parts, tol=TOUCH_M):
             used[j] = True
             seq.append((j, rev))
             e = 2 * j + (0 if rev else 1)               # the end walked out of
-            if len(nb[e]) != 1:
+            k = onward(e)
+            if k is None:
                 break
-            k = nb[e][0]
             jj = k // 2
             if used[jj]:
                 break
@@ -160,12 +219,14 @@ def chains(parts, tol=TOUCH_M):
     return out
 
 
-def branch_ties(xys, brs, tol=COUPLE_M):
+def branch_ties(xys, brs, tol=COUPLE_M, joints=None):
     """[(chain a, its end sample, chain b, b's sample)]: each chain end (xys: per chain its samples (m, 2); brs: per chain
     bool (m,), bridge) that lies within tol of another chain's inner sample on the ground (a slip road ending at the
     joint of an overpass road's parts, or alongside the road it joins, at the road's node or a little short of it: no
     other chain end meets it there, so the road is no branch point to `chains` and the slip road would be left at its
-    own ground). Held to that sample's height; its chain is solved with the one it meets. Pure."""
+    own ground). Held to that sample's height; its chain is solved with the one it meets. joints: per chain the points
+    (k, 2) where its parts join: an end at one is tied there on a deck too (a slip road leaving at a junction the
+    carriageway runs on through, chains(through=True), on a viaduct). Pure."""
     boxes = [(q.min(0) - tol, q.max(0) + tol) for q in xys]
     out = []
     for na, xy in enumerate(xys):
@@ -179,7 +240,9 @@ def branch_ties(xys, brs, tol=COUPLE_M):
                     continue                    # (an end meeting an end: a branch point, coupled as such)
                 d = np.hypot(*(q[1:-1] - p).T)
                 j = int(np.argmin(d)) + 1
-                if d[j - 1] > tol or (brs[nb][j - 1] and brs[nb][j] and brs[nb][j + 1]):
+                at_joint = joints is not None and len(joints[nb]) and \
+                    float(np.min(np.hypot(*(np.asarray(joints[nb], np.float64).reshape(-1, 2) - p).T))) <= tol
+                if d[j - 1] > tol or (brs[nb][j - 1] and brs[nb][j] and brs[nb][j + 1] and not at_joint):
                     continue                    # (too far, or on a deck: a road under a bridge is no branch of it)
                 if best is None or d[j - 1] < best[0]:
                     best = (float(d[j - 1]), nb, j)
