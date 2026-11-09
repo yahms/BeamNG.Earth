@@ -266,5 +266,19 @@ class LockTest(unittest.TestCase):
         xproc.release(self.lock)
 
 
+class SwitchesSigTest(unittest.TestCase):
+    """The plan signature holds the build switches, not what the server sets for itself."""
+
+    def test_server_set_variables_change_nothing(self):
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("BNE_")}
+        with mock.patch.dict(os.environ, clean, clear=True):
+            self.assertEqual(plancache.switches_sig(), "")
+            os.environ["BNE_NETSTATS_PROC"] = "/tmp/netstats/1234"
+            os.environ["BNE_3DMR"] = "off"
+            self.assertEqual(plancache.switches_sig(), "")
+            os.environ["BNE_INTERCHANGE"] = "1"
+            self.assertTrue(plancache.switches_sig().startswith("x"))
+
+
 if __name__ == "__main__":
     unittest.main()

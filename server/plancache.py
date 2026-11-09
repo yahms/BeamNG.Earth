@@ -87,7 +87,11 @@ FRAMES = "r10"          # the plans' frames: their planning regions' (geotiles.P
 # BNE_* settings that change no plan (the caches' own, what is sent when): not part of a plan's signature
 NOT_PLAN_SWITCHES = ("BNE_REVISIT", "BNE_REVISIT_MB", "BNE_REVISIT_SKIP", "BNE_ROADS_SEND_M", "BNE_ROADS_DROP_M",
                      "BNE_ROADS_LEAD_S", "BNE_ROADS_LEAD_M", "BNE_CW_DEBUG", "BNE_CW_DUMP", "BNE_CW_HELP",
-                     "BNE_PLAN_WAIT_ANY")
+                     "BNE_PLAN_WAIT_ANY",
+                     # (set by the server itself: its netstats folder, a path of each run, and the player's 3dmr.eu
+                     # models setting; with them every run's plans had a signature of their own, a default player's a
+                     # switches one, 2026-11-10)
+                     "BNE_NETSTATS_PROC", "BNE_3DMR")
 
 
 def switches_sig():
