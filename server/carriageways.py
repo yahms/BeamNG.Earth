@@ -326,7 +326,6 @@ class _Chain:
             self.A = np.linalg.inv(A)    # (each round solves many right-hand sides: one inverse, then products)
             return
         self.A = None
-        l0, l1, l2 = np.zeros(n), np.zeros(n), np.zeros(n)
         a0, a1, a2 = A0.tolist(), A1.tolist(), A2.tolist()
         L0, L1, L2 = [0.0] * n, [0.0] * n, [0.0] * n
         for i in range(n):
@@ -392,7 +391,6 @@ def solve_py(chains, couplings=(), rounds=PY_ROUNDS, deadline=None):
         ch.lo = None if c.get("lo") is None else np.asarray(c["lo"], np.float64)
         ch.hi = None if c.get("hi") is None else np.asarray(c["hi"], np.float64)
         cs.append(ch)
-    off = np.r_[0, np.cumsum([c.n for c in cs])].astype(int)
     eqs = [(a, i, b, j, 0.0, MU) for a, i, b, j, kind, v in couplings if kind == "eq"]
     # ("near": z_a[i] ~ z_b[j] with weight v, a soft pull the limits and bounds win over: a divided road's two
     # carriageways side by side)

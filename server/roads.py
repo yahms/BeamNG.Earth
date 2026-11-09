@@ -7723,40 +7723,6 @@ def _under_decks(xy, z, decks):
 _DECK_PACK = [(None, None)]     # [(the decks list, its packed arrays)]: one tile's walls ask with the same list
 
 
-def _under_walls_on():
-    """grading's abutment walls under carriageway decks are on (BNE_INTERCHANGE and BNE_UNDER_WALLS)."""
-    import grading
-    return bool(grading.CW_ON and grading.UNDER_WALLS_ON)
-
-
-def _deck_underside(xy, decks):
-    """Per point of xy (k, 2): the underside (m) of the deck chunk over it (its road height there less its slab and
-    girders, ch["depth"] when given, else DECK_FULL_DEPTH), NaN where none is within its half width + 1 m. Pure."""
-    xy = np.asarray(xy, np.float64).reshape(-1, 2)
-    out = np.full(len(xy), np.nan)
-    for ch in decks or ():
-        n = np.asarray(ch.get("n", ()), np.float64)
-        if n.ndim != 2 or len(n) < 2:
-            continue
-        reach = float(ch.get("w") or 0.0) / 2 + 1.0
-        lo, hi = n[:, :2].min(0) - reach, n[:, :2].max(0) + reach
-        near = ((xy >= lo) & (xy <= hi)).all(1)
-        if not near.any():
-            continue
-        a, b = n[:-1, :2], n[1:, :2]
-        d = b - a
-        L2 = np.maximum((d * d).sum(1), 1e-12)
-        depth = float(ch.get("depth") or DECK_FULL_DEPTH)
-        for i in np.flatnonzero(near):
-            t = np.clip(((xy[i] - a) * d).sum(1) / L2, 0.0, 1.0)
-            dd = np.hypot(*(a + t[:, None] * d - xy[i]).T)
-            j = int(np.argmin(dd))
-            if dd[j] <= reach:
-                zz = float(n[j, 2] + (n[j + 1, 2] - n[j, 2]) * t[j]) - depth
-                out[i] = zz if not np.isfinite(out[i]) else min(out[i], zz)
-    return out
-
-
 def _deck_pack(decks):
     """(points (n, 3), starts (C + 1,), reach (C,)) of the deck chunks with 2 points or more, or None."""
     if not decks:
