@@ -450,7 +450,7 @@ DECK_GROUND_ON = os.environ.get("BNE_DECK_GROUND", "on") != "off"
 DECK_GROUND_GAP_M = 0.10
 DECK_GROUND_STEP_M = 4.0
 # ... and a freeway plan's end meets its deck's road exactly (_meet_decks)
-DECK_MEET_ON = os.environ.get("BNE_DECK_MEET", "on") != "off"
+DECK_MEET_ON = os.environ.get("BNE_DECK_MEET", "off") == "on"     # off: dev's bridge seams (SEAMS_ON, _pin_cw_ends) bring a freeway's end to its deck; on: this eases the last cm onto the deck's road too
 DECK_MEET_M = 20.0          # m over which the end is eased onto the deck's height
 DECK_MEET_MESH_M = 0.01     # m the road mesh lies over a deck's top (roadmesh: the deck's asphalt 1 cm over its slab)
 DECK_MEET_MAX_M = 0.5       # m: a larger difference is not this deck's end (left as it is)     # m between a deck's profile points kept for it
