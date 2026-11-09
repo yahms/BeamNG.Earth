@@ -33,7 +33,7 @@ M.TILE_CAP = { { 300, 6000 }, { 700, 2400 }, { 1500, 900 }, { 1e9, 400 } }
 -- ridges and a rock placed on the real ground floated over the drawn one (Stelvio pass, the user's report 2026-10-17)
 M.GROUP_MAX_M = { shrub = 250, desert_shrub = 250, rock = 400, desert_rock = 400, cliff = 1500, pylon = 1500, hvpole = 1000, gantry = 800, sub_breaker = 400, sub_mast = 1000, sub_support = 300,
   sub_transformer = 500, sub_fence = 200, lamplens = 800, fr_lantern_light = 800, fr_wood_pole = 800, eu_wood_pole = 800, fr_lantern = 500, fr_j1 = 300, fr_j3 = 300, fr_j6 = 300, fr_j4_l = 400, fr_j4_r = 400, fr_signpost = 500, lampglow = 6000, rrcross = 300, rrcross_eu = 300, rrflash = 400,
-  rrflash_eu = 400, rrgate = 400, rrgate_l = 400, rrgate_eu = 400, rrgate_eu_l = 400, door = 120, hydrant = 200, bin = 200, bench = 200, polelamp = 400,
+  rrflash_eu = 400, rrgate = 400, rrgate_l = 400, rrgate_eu = 400, rrgate_eu_l = 400, catmast = 700, catmast_eu = 700, catpost = 700, catpost_eu = 700, door = 120, hydrant = 200, bin = 200, bench = 200, polelamp = 400,
   stop = 300, giveway = 300, signal = 500, fence = 150, wallsign_logistics = 800, wallsign_rentabox = 800, wallsign_lemon = 800, wallsign_turboburger = 500,
   speed30 = 300, speed40 = 300, speed50 = 300, speed60 = 300, speed70 = 300, guardrail = 4000, guardrail_start = 4000, guardrail_end = 4000,
   guardrail_back = 4000, guardrail_back_start = 4000, guardrail_back_end = 4000 }
@@ -88,7 +88,7 @@ M.ONE_SPELLING = { door = true, hydrant = true, bin = true, bench = true, busshe
   barn = true, celltower = true, container = true, gantry = true, giveway = true, stop = true, signal = true,
   picnicgrill = true, picnictable = true, pylon = true, hvpole = true, tollbooth = true, watertower = true, cable = true,
   rrcross = true, rrcross_eu = true, rrflash = true, rrflash_eu = true, rrgate = true, rrgate_eu = true,
-  rrgate_eu_l = true, rrgate_l = true, sub_breaker = true, sub_fence = true, sub_mast = true, sub_support = true,
+  rrgate_eu_l = true, rrgate_l = true, catmast = true, catmast_eu = true, catpost = true, catpost_eu = true, sub_breaker = true, sub_fence = true, sub_mast = true, sub_support = true,
   sub_transformer = true, wallsign_lemon = true, wallsign_logistics = true, wallsign_rentabox = true,
   wallsign_turboburger = true }
 
@@ -227,6 +227,12 @@ M.CATALOG = {
   rrflash = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_flasher', 4.7 } }, rrflash_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_flasher_eu', 4.7 } },
   rrgate = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate', 8.25 } }, rrgate_l = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_l', 8.25 } },
   rrgate_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_eu', 8.25 } }, rrgate_eu_l = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_eu_l', 8.25 } },
+  -- railway catenary mast with its cantilever (server catenary.py; tools/blender/build_catenary.py); its +x toward the track
+  catmast = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_cat_mast', 9.0 } },
+  catmast_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_cat_steel', 9.3 } },
+  -- a rigid portal's posts (the girder between them is the tile's wire mesh: server catenary.portal_wires)
+  catpost = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_cat_post_su', 10.4 } },
+  catpost_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_cat_post_eu', 10.4 } },
   tropical = {
     { JRI .. 'trees/bush_tropical_1/tro_bush_huge', 5.5 }, { JRI .. 'trees/bush_tropical_2/tro_bush_2_small', 6.1 },
     { JRI .. 'trees/trees_tropical_2/tro_tree_2_filler', 20.2 }, { JRI .. 'trees/trees_tropical_1/tro_tree_1_huge', 20.6 },
@@ -790,6 +796,12 @@ end
 -- world loads (the governor's loading frames: a teleport, the level's start, a stop) or with no frame budget (tools).
 M.NEW_SHAPES_PER_FRAME = 1
 local touched, touchedItems, newShapes = {}, 0, 0
+local frameWork = { { made = 0, removed = 0, shapes = 0, items = 0, new = 0, forests = 0 },
+  { made = 0, removed = 0, shapes = 0, items = 0, new = 0, forests = 0 } }     -- the last two passes' (M.frameWork)
+local workMade, workRemoved = 0, 0
+-- The last two passes' work ([1] the last): items made / removed, shapes touched and their items in the level, shapes
+-- new this session, Forests made.
+function M.frameWork() return frameWork end
 local newShapeCap = math.huge
 local everMade = {}     -- shape -> true once it had items this session (the engine keeps it loaded)
 local function allow(shape)
@@ -1183,6 +1195,15 @@ function M.update(anchorId, player, view, frameMs)
     clock = stopwatch.new() } or nil
   local budget = M.PER_FRAME * M.EVERY_N
   local limit, elapsed = frameMs or M.FRAME_MS, M.clock()
+  -- the previous pass's work, for a hitch's context (core.perfContext: the engine's tick pays for a pass's Forest
+  -- changes, 0.5 us an item of every shape touched; a repeatable 136-612 ms tick beside a Manhattan park, 2026-11-08)
+  local w = frameWork[2]
+  frameWork[2], frameWork[1] = frameWork[1], w
+  local nTouched = 0
+  for _ in pairs(touched) do nTouched = nTouched + 1 end
+  w.made, w.removed, w.shapes, w.items, w.new, w.forests = M.made - workMade, M.removed - workRemoved, nTouched,
+    touchedItems, newShapes, newForests
+  workMade, workRemoved = M.made, M.removed
   newForests = 0
   M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)
   touched, touchedItems, newShapes = {}, 0, 0

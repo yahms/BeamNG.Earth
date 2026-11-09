@@ -1546,18 +1546,37 @@ class Server:
         rate = min(self.delete_max_rate, len(self.delete_queue) / DELETE_DRAIN_S)
         return min(self.delete_interval, 1.0 / rate) if rate > 0 else self.delete_interval
 
-    def _delete_one(self):
+    def _delete_pick(self):
+        """The next queued delete as a call doing the file work (None: the file stays). The decision is the event loop's
+        (the tile caches); the file work need not be: _remove alone held the loop 2.8 and 5.0 s after a teleport
+        (2026-11-09, os.remove under a busy disk), every game message waiting."""
         path, ck = self.delete_queue.popleft()
         # an evicted tile built again since (same file name) keeps its new file; ck callable: kept while it says so
+        # (asked again in the worker right before the file goes: a delete held up by a slow disk must not take the file
+        # of a tile built again meanwhile under the same name; the checks are membership reads)
         if callable(ck):
             if ck():
-                return
-            self._remove(path)
-        elif ck is None or (ck not in self.tiles and ck not in self.tile_inflight):
-            if os.path.isdir(path):     # a released session's folder, queued after its files
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                self._remove(path)
+                return None
+
+            def work():
+                if not ck():
+                    self._remove(path)
+            return work
+        if ck is None or (ck not in self.tiles and ck not in self.tile_inflight):
+            def work():
+                if ck is not None and (ck in self.tiles or ck in self.tile_inflight):
+                    return
+                if os.path.isdir(path):     # a released session's folder, queued after its files
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    self._remove(path)
+            return work
+        return None
+
+    def _delete_one(self):
+        work = self._delete_pick()
+        if work is not None:
+            work()
 
     def geo_held(self, kind, k):
         """Does some connection's tracker of kind (GEO_TRACKERS) have geotile k (gx, gy) sent or building?"""
@@ -1656,10 +1675,24 @@ class Server:
             return
         self._deleting = True
         due = [loop.time() + self.delete_gap()]
+        if getattr(self, "_delete_pool", None) is None:
+            # (one thread: the deletes stay in order and paced, off the event loop)
+            self._delete_pool = ThreadPoolExecutor(1, thread_name_prefix="delete")
 
         def step():
-            if self.delete_queue:
-                self._delete_one()
+            work = self._delete_pick() if self.delete_queue else None
+            if work is None:
+                after()
+                return
+            try:
+                fut = loop.run_in_executor(self._delete_pool, work)
+            except RuntimeError:            # (the pool shut down: at exit)
+                work()
+                after()
+                return
+            fut.add_done_callback(lambda _f: after())
+
+        def after():
             if self.delete_queue:
                 # a gap after the last one was due, not after it ran: Windows' loop wakes up to ~16 ms late at every
                 # timer (a 25 ms gap took 33, 40 files/s became 30); behind by more than a gap (a stall): afresh,
@@ -2329,15 +2362,20 @@ class Server:
         (blockworker.prebuild_geo), the game sent nothing. -> its revisit key, or None (not complete: tried later)."""
         if self.mapdata is None or self.road_pool is None or not revisitmod.ON:
             return None
+        import roadz
         lh, mph, buried, lamps, country, gzoom = self.geo_rules(gx, gy)
         # (beside the session folders, as a session's: a 3dmr.eu model baked there finds the models' cache, its textures'
         # game path and the mod's materials file where the game's own tiles do: buildings._custom_tile_entries, PR #626)
         scratch = os.path.join(self.root, "areas_scratch")
         fast = self.fast_pool           # (fast mode: its own processes, the game paused: no need to stand back)
         submit = fast.submit if fast is not None else getattr(self.road_pool, "submit_low", self.road_pool.submit)
+        # (the fast mode's own processes may wait for a cell's lidar; the live pool keeps its short wait)
+        timeout = (max(ROAD_TILE_TIMEOUT_S, roadz.PRECACHE_LIDAR_WAIT_S + 120.0) if fast is not None
+                   else ROAD_TILE_TIMEOUT_S)
         return poolsmod.result_running(submit(
             blockworker.prebuild_geo, gx, gy, gzoom, scratch, self.buildings, lh, mph, self.gas_stations, buried,
-            lamps, country, "/temp/beamngEarth/areas_scratch", pole_profile=Server.pole_profile(self)), ROAD_TILE_TIMEOUT_S)
+            lamps, country, "/temp/beamngEarth/areas_scratch", pole_profile=Server.pole_profile(self),
+            wait_gaps=fast is not None), timeout)
 
     def build_roads_tile(self, aid, tx, ty):
         """roads.py: one road tile of anchor aid, written to the session folder. Returns (vfs path,
@@ -2508,6 +2546,8 @@ class Server:
         infra_fn = lambda key: self.mapdata.cell(key, layers=("infrastructure",), kind="demand").layers.get("infrastructure")
         low_parapet_decks = set()
         deck_parts = []                 # the bridges' parts near the tile (the median barriers' on joined decks too)
+        guardrail_decks = []
+        rail_decks = []                 # railways.tile_mesh fills these in below (fences.py stands walls on them)
         try:
             deck_parts = list(anchor.bridges.parts(cells, (box[0]-10, box[1]-10, box[2]+10, box[3]+10)))
             deck_parts = buildingsmod.bridge_stub_parts(_bridge_fps, deck_parts)
@@ -2554,13 +2594,14 @@ class Server:
                                  low_parapet_decks=low_parapet_decks, pads=pads)
         tmesh = roadmeshmod.tunnel(chunks, (x0, y0, 0.0), rwalls)
         import railways
-        rmesh = railways.tile_mesh(anchor.frame, tx, ty,
+        rmesh, rail_decks = railways.tile_mesh(anchor.frame, tx, ty,
                                    [cell_fn(k) for k in roadsmod.cells_of_tile(anchor.frame, tx, ty, railways.REACH_M)],
                                    railways.point_ground(anchor.frame, elev, (aid, anchor.lat, anchor.lon)),
                                    far_ground=railways.point_ground(
                                        anchor.frame,
                                        lambda la, lo: self.ground(anchor.frame, la, lo, self.dem.sample(la, lo, zoom)),
-                                       ("raw", aid, anchor.lat, anchor.lon)))
+                                       ("raw", aid, anchor.lat, anchor.lon)),
+                                   return_decks=True)
         bld = None
         garage_sound = ()
         oil_wells = []
@@ -2583,7 +2624,7 @@ class Server:
             import fences
             try:
                 props.extend(fences.rows(anchor.frame, infra_fn, box, elev, decks=[
-                    {"n": np.column_stack((xy, z)), "w": spec.width} for _f, spec, xy, z, _l in deck_parts]))
+                    {"n": np.column_stack((xy, z)), "w": spec.width} for _f, spec, xy, z, _l in deck_parts] + rail_decks))
             except Exception as ex:
                 log.warning("fences: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
             import picnic
@@ -2598,7 +2639,8 @@ class Server:
                 log.warning("picnic: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
             import shelters
             try:
-                props.extend(shelters.rows(anchor.frame, infra_fn, box, elev, near_roads))
+                props.extend(shelters.rows(anchor.frame, infra_fn, box, elev, near_roads, lambda k: self.mapdata.cell(
+                    k, layers=("roads",), kind="demand").layers.get("roads")))
             except Exception as ex:
                 log.warning("shelters: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
             import industry
@@ -3946,6 +3988,11 @@ class Server:
         if self.net.slow() is not None:     # (map data at a crawl: a new place's roads take minutes: GitHub #241;
             # no number in it: the note is re-sent whenever its text changes)
             parts.append("slow internet connection: new places take a few minutes to load")
+        disk = getattr(self, "disk_cache", None)
+        if disk is not None and disk.managed and disk.disk_short() > 0:
+            # (a full drive fails far tiles, blocks and caches with "No space left on device": the first week's most
+            # frequent errors; the cache is cut back to its reserve, but other files may fill the drive)
+            parts.append("your drive is nearly full: free some space (the download cache is cut back)")
         return "Degraded: " + "; ".join(parts) if parts else ""
 
     def level_summary(self):
@@ -7478,8 +7525,9 @@ class Connection:
         return xy
 
     def camera_away(self, cam):
-        """The camera's (x, y) from a pose's cam when it is more than VIEW_AWAY_M from the car (a free camera, a far
-        chase camera), else None. What is drawn follows it: the far field, and the road, tree and far building tiles
+        """The point a pose's cam is about when it is more than VIEW_AWAY_M from the car, else None: the 3D map's
+        orbit target (tx / ty) when the pose carries one, otherwise the camera's own (x, y) (a free camera, a far
+        chase camera). What is drawn follows it: the far field, and the road, tree and far building tiles
         round it as well as round the car; what collides stays round the car (the terrain block, the road and
         building colliders in the tiles round the car, the nav graph). The user, 2026-10-20: "All collision ...
         should be following the car while visual stuff should follow the camera"."""
@@ -8537,6 +8585,7 @@ async def main_async(args):
     except Exception as e:      # (no saved areas; never the server)
         log.warning("saved areas: %s", e)
     try:            # the map's cache view: its index built in the background from the cache's keys (covermap.py)
+        server.disk_cache = disk            # (net_note: a drive short of its free reserve, cache.disk_short)
         server.covermap = covermapmod.CoverMap(disk, args.cache_dir, mapdata if args.roads == "on" else None,
                                                server.world_signature).start()
     except Exception as e:      # (the map's view stays empty; never the server)
@@ -9151,6 +9200,13 @@ def main():
                          "never what this session used within the hour, the gravity model or netstats/")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    try:
+        bad = _app_modules()[0].drive_relative_problem(args.cache_dir)
+    except Exception:
+        bad = None
+    if bad:                     # (GitHub #895: c:\games\x with its backslashes dropped went to the current folder;
+        ap.error(f"--cache-dir: {bad}")     # checked before anything writes there: cdn.chain's cdn.json)
+    args.cache_dir = os.path.abspath(os.path.expanduser(args.cache_dir))
     os.environ["BNE_BRIDGE_PROFILE"] = args.bridge_profile     # read by roads.py here and in the block workers
     args.cells = resolve_cells(args.cells, args.near_visual)
     args.block = resolve_block(args.block, args.near_visual)
@@ -9170,6 +9226,7 @@ def main():
         ap.error("--horizon needs --near-visual mesh (terrain mode is frozen at the v1.3.1 layout)")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log.info("download cache: %s", args.cache_dir)
     raise_open_files()
     import fast
     try:

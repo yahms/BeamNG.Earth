@@ -13,6 +13,7 @@ far_geometry(...) (the far-tile workers, the same state) are its jobs. warm_q (a
 lon, [mapcells.CellKey]), the latest list replacing the earlier one.
 """
 from runtimeprofiler import step as profile_step
+import collections
 import logging
 import os
 import queue
@@ -30,6 +31,7 @@ import geodesy
 import grading as gradingmod
 import heightmap
 import mapdata as mapdatamod
+import mappedpoles
 import netfetch
 import plancache
 import roadwidth as roadwidthmod
@@ -160,9 +162,19 @@ def _rss_mb():
 
 def _trace_memory(every_s=60.0, top=10):
     """BNGE_TRACEMALLOC: log this worker's resident size, what Python and numpy hold of it and its top allocation
-    sites every every_s (the rest is native: DuckDB, the allocator's free lists)."""
+    sites every every_s (the rest is native: DuckDB, the allocator's free lists). BNGE_TRACEMALLOC=N (N > 1): N frames
+    a site, each counted at its innermost frame in the server's own files (numpy's fromnumeric.py:54 named the line of
+    ours that made the array); slower, for the PC (on a Steam Deck even 1 frame stalled the drive)."""
     import tracemalloc
-    tracemalloc.start(1)
+    depth = max(1, int(os.environ.get("BNGE_TRACEMALLOC", "1") or 1))
+    tracemalloc.start(depth)
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def site(tb):
+        for fr in reversed(tb):                 # (most recent call last)
+            if os.path.dirname(os.path.abspath(fr.filename)) == here:
+                return f"{os.path.basename(fr.filename)}:{fr.lineno}"
+        return f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}"
 
     def loop():
         log = logging.getLogger("earthd.worker")
@@ -170,9 +182,16 @@ def _trace_memory(every_s=60.0, top=10):
             time.sleep(every_s)
             snap = tracemalloc.take_snapshot()
             total = sum(st.size for st in snap.statistics("filename"))
+            if depth > 1:
+                by = collections.Counter()
+                for st in snap.statistics("traceback"):
+                    by[site(st.traceback)] += st.size
+                top_sites = by.most_common(top)
+            else:
+                top_sites = [(f"{os.path.basename(st.traceback[0].filename)}:{st.traceback[0].lineno}", st.size)
+                             for st in snap.statistics("lineno")[:top]]
             log.info("memory pid %d: rss %.0f MB, traced %.0f MB; top: %s", os.getpid(), _rss_mb(), total / 1e6,
-                     "; ".join(f"{os.path.basename(st.traceback[0].filename)}:{st.traceback[0].lineno} "
-                               f"{st.size / 1e6:.0f} MB" for st in snap.statistics("lineno")[:top]))
+                     "; ".join(f"{k} {v / 1e6:.0f} MB" for k, v in top_sites))
     threading.Thread(target=loop, daemon=True, name="trace-mem").start()
 
 
@@ -910,7 +929,10 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
                                  pole_profile=pole_profile, signs=signs, roadside_jobs=roadside_jobs,
                                  signals=furniture.signals_for(_s.md, frame, near_cells), nodes=nodes,
                                  development=developmentmod.for_tile(_s.md, frame, tx, ty),
-                                 clearance_out=clearance, towns=towns)
+                                 clearance_out=clearance, towns=towns,
+                                 # (the mapped utility poles mappedpoles.tile_poles draws: no guessed ones along them)
+                                 mapped_poles=(mappedpoles.road_points(_s.md, frame, tx, ty, pole_profile)
+                                               if props is not None else None))
     P.town_faces = town_faces
     mark("build_tile")
     chunks += railsmod.tile_chunks(frame, tx, ty, cells, country, urban)     # railway and tram tracks on the ground
@@ -963,6 +985,8 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
     infra_fn = lambda key: _s.md.cell(key, layers=("infrastructure",), kind="demand").layers.get("infrastructure")
     low_parapet_decks = set()
     deck_parts = []                 # the bridges' parts near the tile (the median barriers' on joined decks too)
+    guardrail_decks = []
+    rail_decks = []                 # railways.tile_mesh fills these in below (fences.py stands walls on them)
     try:
         deck_parts = list(bridges.parts(cells, (box[0]-10, box[1]-10, box[2]+10, box[3]+10)))
         if _bridge_fps:
@@ -1010,13 +1034,30 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
             fra_kits = _s.fra.kits(frame, roadsmod.cells_of_tile(frame, tx, ty))
         except Exception as e:
             log.debug("fra kits: %s: %s", type(e).__name__, e)
-    rr_kits = railways.crossing_props(frame, tx, ty, rcells, rground, left_hand, fra_kits)   # level crossings
+    rr_kits = railways.crossing_props(frame, tx, ty, rcells, rground, left_hand, fra_kits, country)   # level crossings
     if rr_kits:
         props = (props or []) + rr_kits
-    P.rmesh = railways.tile_mesh(frame, tx, ty, rcells, rground,
+    import catenary
+    if catenary.ENABLED and wires is not None:      # masts and wires along the electrified lines (BNE_CATENARY)
+        try:
+            # (the graded ground only near the tile, as the track's mesh reads it: the masts' spans reach 130 m out, and
+            # asking the graded ground there made the grader plan every cell round the tile first)
+            c_ground = railways._mixed(rground, railways.point_ground(
+                frame, lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)), ("raw",) + tuple(rkey)),
+                roadsmod.tile_bbox(tx, ty))
+            _bx, _by = roadsmod.tile_bbox(tx, ty)[:2]
+            c_rows, c_wires = catenary.build(frame, tx, ty, rcells, c_ground,
+                                             [np.asarray(sp.ring, np.float64) + [_bx, _by] for sp, _g0, _g1 in (items or [])], country)
+            if c_rows:
+                props = (props or []) + c_rows
+            wires.extend(c_wires)
+        except Exception as e:
+            log.debug("catenary: %s: %s", type(e).__name__, e)
+    P.rmesh, rail_decks = railways.tile_mesh(frame, tx, ty, rcells, rground,
                                  far_ground=railways.point_ground(
                                      frame, lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
-                                     ("raw",) + tuple(rkey)))
+                                     ("raw",) + tuple(rkey)),
+                                 return_decks=True)
     mark("railways")
     bld = None
     garage_sound = ()
@@ -1039,12 +1080,11 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
         # for one Szeged tile against 1.6.3's 4 and 16; the grading only moves ground near roads, which towers keep off)
         powerlines.tile_lines(frame, tx, ty, _s.md, lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
                               props, wires, clearance=clearance[0] if clearance else None)
-        import mappedpoles
         mappedpoles.tile_poles(frame, tx, ty, _s.md, elev, props, wires, pole_profile, urban)
         import fences
         try:
             props.extend(fences.rows(frame, infra_fn, box, elev, decks=[{"n": np.column_stack((xy, z)), "w": spec.width}
-                                                                        for _f, spec, xy, z, _l in deck_parts]))
+                                                                        for _f, spec, xy, z, _l in deck_parts] + rail_decks))
         except Exception as ex:
             log.warning("fences: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
         import picnic
@@ -1058,7 +1098,8 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
             log.warning("picnic: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
         import shelters
         try:
-            props.extend(shelters.rows(frame, infra_fn, box, elev, near_roads))
+            props.extend(shelters.rows(frame, infra_fn, box, elev, near_roads, lambda k: _s.md.cell(
+                k, layers=("roads",), kind="demand").layers.get("roads")))
         except Exception as ex:
             log.warning("shelters: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
         import industry
@@ -1278,7 +1319,7 @@ def _geo_content_key(key, zoom, buildings, left_hand, mph, gas_stations, buried,
 
 
 def prebuild_geo(gx, gy, zoom, scratch, buildings, left_hand, mph, gas_stations, buried=0.0, lamp_region=None,
-                 country=None, scratch_vfs="/x", pole_profile=None):
+                 country=None, scratch_vfs="/x", pole_profile=None, wait_gaps=False):
     """Saved areas' world phase (areas.py, the user 2026-10-29: "pre generate along a route or area"): geotile (gx, gy)'s
     road content (_geo_content: roads, sidewalks, bridges, buildings, street furniture) built into the revisit cache
     ahead of play; nothing for the game (its files written to scratch, then removed). The revisit key when the content
@@ -1292,8 +1333,14 @@ def prebuild_geo(gx, gy, zoom, scratch, buildings, left_hand, mph, gas_stations,
     if not os.path.exists(path):
         os.makedirs(scratch, exist_ok=True)
         try:
-            _geo_content(gx, gy, zoom, scratch, scratch_vfs, buildings, left_hand, mph, gas_stations, buried,
-                         lamp_region, country, pole_profile=pole_profile)
+            if wait_gaps:       # (the fast mode's own road processes, the game paused: no live tile waits on them)
+                import roadz
+                with roadz.precache_gaps_wait():
+                    _geo_content(gx, gy, zoom, scratch, scratch_vfs, buildings, left_hand, mph, gas_stations, buried,
+                                 lamp_region, country, pole_profile=pole_profile)
+            else:               # (the live road pool: keep its short lidar wait, live play shares these processes)
+                _geo_content(gx, gy, zoom, scratch, scratch_vfs, buildings, left_hand, mph, gas_stations, buried,
+                             lamp_region, country, pole_profile=pole_profile)
         finally:
             for name in geo_names(tile_key).values():
                 try:

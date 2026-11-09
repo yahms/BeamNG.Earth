@@ -18,11 +18,14 @@ MODULES = (
     "test_connection_cleanup", "test_initial_loading", "test_tile_ownership", "test_matslots", "test_stream_reconnect",
     "test_netfetch", "test_mapdata", "test_rangeread", "test_grading", "test_roadz", "test_roadz_inputs",
     "test_road_seams", "test_roadgeo", "test_fast", "test_restart",
-    "test_revisit", "test_plancache", "test_chunkcache", "test_pools",
+    "test_revisit", "test_plancache", "test_bake_formats", "test_chunkcache", "test_pools",
     "test_prefetch_chain", "test_demand", "test_roadwidth", "test_roadcorners",
     "test_sketchfab_assets", "test_subsea_tunnels", "test_tunnels",
     "test_worldbundle", "test_world_cache", "test_peerwork",
     "test_host_package", "test_carriageway_solver",
+    "test_portugal_imagery",
+    "test_rail_crossing_assets",
+    "test_native_stress",
 )
 
 

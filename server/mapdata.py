@@ -275,6 +275,8 @@ class MapData:
         # their reads at the tile's build start, so they are mostly there when the props ask at its end
         self.side_sources = [self.picnic_osm]
         self.rasters = maprasters.Rasters(self.raw_dir, self.fetcher, os.path.join(cache_dir, "dem", "lidarbc"))
+        import lod2roofs                # (Germany's measured roofs: shape and height of each building)
+        self.lod2_roofs = lod2roofs.Source(cache_dir, self.fetcher) if lod2roofs.ON else None
         import railtags                 # (OSM's railway tags joined to the roads layer's rail segments)
         self.rail_tags = railtags.RailTags(cache_dir, self.fetcher) if railtags.ON else None
         import regionaldata
@@ -839,6 +841,9 @@ class MapData:
         with self._mem_lock:
             self._mem.clear()
             self._mem_bytes = 0
+        for tags in (self.rail_tags, self.lane_tags):       # (the OSM tag shards: ~20 MB each)
+            if tags is not None:
+                tags.clear_memory()
 
     def _remember(self, k, entry):
         """Keep a decoded layer for the next cell() of it (at most MEM_MB in all, least recently used out)."""

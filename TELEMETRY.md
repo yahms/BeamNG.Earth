@@ -91,7 +91,7 @@ Over each 5 minutes:
 
 | field | example | why |
 |---|---|---|
-| frame times | how many frames fell into fixed steps (gives average fps, 1% low, 95th / 99th percentile) | how smooth the game was |
+| frame times | how many frames fell into fixed steps (gives average fps, 1% low, 95th / 99th percentile); frames while the game is paused or in the background are left out | how smooth the game was |
 | the same per speed band | the steps for town speeds vs the highway | so fast driving is not hidden in an average |
 | hitches | how many frames over 50 / 100 / 250 / 1000 ms (and how many of those while loading after a teleport), and for the slow ones the name of the part that took longest (a BeamNG.Earth part such as `roads`, or an engine subsystem such as `RenderShadows`, or "outside" both) | which part to fix first |
 | fps drops | how many, how long, the lowest (rounded) | stutter you notice |
@@ -159,8 +159,8 @@ before any of it is sent.
   your choice. Releases before it sent sections 1 and 6 by default, with an off switch in settings.
 - **Development builds** (the `dev.N` pre-releases): sections 2-5 (performance data) are sent from 2026-11-08 on,
   only while Performance data is ticked. The welcome screen asks everyone again first (also those who chose before).
-- **Releases**: sections 2-5 are measured and kept next to the last report (`telemetry_last.json` in the cache folder,
-  under `perf_not_sent_yet`) but not sent until a release whose notes say so.
+- **Releases**: from the release after 1.8.2, sections 2-5 are sent as on the development builds, only while
+  Performance data is ticked. (Earlier releases measured them and kept them next to the last report without sending.)
 - **Being added**: a **What is sent** button that shows the last report exactly as it left your computer, and the
   public performance page.
 

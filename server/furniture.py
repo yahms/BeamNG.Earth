@@ -87,6 +87,10 @@ LAMP_CURB_M = 0.5           # m from the curb onto the sidewalk
 POLE_SPACING = 45.0
 POLE_CLASSES = {"secondary", "tertiary", "residential", "unclassified"}
 POLE_OFF_M = 2.4            # m beyond the carriageway's edge
+# A road with mapped utility poles along it (mappedpoles.road_points: this many within this far of its edge) guesses
+# none of its own: the mapped ones stand there (the user, 2026-11-07, of a village with its poles in OpenStreetMap)
+MAPPED_ALONG_MIN = 2
+MAPPED_ALONG_M = 15.0
 END_CLEAR_M = 4.0           # m kept clear of a run's ends (corners, crosswalk ramps)
 CLEAR_OTHER_M = 1.5         # m kept off another road's carriageway
 G_LAMP, G_POLE = "streetlight", "pole"
@@ -151,12 +155,12 @@ WIRE_R = 0.012                  # m half width of a wire's ribbons
 WIRE_VERTS_MAX = 60000          # a tile's wire mesh at most (the engine's 16-bit index buffers; railways.VERTS_MAX)
 
 
-def wire_lines(poles, anchors=None, radius=None):
+def wire_lines(poles, anchors=None, radius=None, max_span=80.0):
     """Polylines (k, 3) of the wires between consecutive poles [(x, y, z, yaw_deg)] of one road side."""
     out = []
     for (x0, y0, z0, w0), (x1, y1, z1, w1) in zip(poles[:-1], poles[1:]):
         span = math.hypot(x1 - x0, y1 - y0)
-        if span < 5.0 or span > 80.0:
+        if span < 5.0 or span > max_span:
             continue
         k = max(2, int(math.ceil(span / WIRE_SEG_M)))
         t = np.linspace(0.0, 1.0, k + 1)
@@ -578,8 +582,11 @@ G_POLELAMP = "polelamp"     # a cobra-head arm on a utility pole (East Coast USA
 # Networks in Europe" (ICF Consulting, 2003; Europacable / Sycabel km of overhead and underground LV line, ~2000), the
 # underground share of each country's low-voltage km. Countries not listed: mostly overhead (the US, Canada, Japan,
 # Australia, most of the world). Old figures: the shares have only grown since.
-BURIED_LV = {"NL": 1.0, "GB": 0.81, "DE": 0.75, "DK": 0.65, "BE": 0.44, "NO": 0.38, "IT": 0.30, "FR": 0.27,
-             "PT": 0.19, "AT": 0.15, "ES": 0.14}
+# Switzerland (not in that study; GitHub #911: poles along rural Swiss roads that have none): ElCom's line inventory at
+# 2009-12-31, 78,837 km of low-voltage cable (network level 7) to 12,720 km of low-voltage overhead line, 0.86; ElCom's
+# "ElCom in 2024, a brief overview": 90 % of the distribution network underground.
+BURIED_LV = {"NL": 1.0, "CH": 0.86, "GB": 0.81, "DE": 0.75, "DK": 0.65, "BE": 0.44, "NO": 0.38, "IT": 0.30,
+             "FR": 0.27, "PT": 0.19, "AT": 0.15, "ES": 0.14}
 
 
 def buried_share(country):
@@ -927,7 +934,7 @@ def off_buildings(rows, rings, groups=(G_STREET_TREE,), clear=STREET_TREE_WALL_M
 def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=False, decks=(),
           signals=None, buried=0.0, region=None, lighting=None, country=None, priority=None, ground=None,
           clearance=None, development=None, pole_profile=None, pole_frame=None,
-          sign_obstacles=None, defer_gore=False):
+          sign_obstacles=None, defer_gore=False, obstacles=(), mapped_poles=None):
     """Rows [group, x, y, z, yaw, scale, height, rank] (trees.lua's tile rows) of the lamps and poles of a
     tile box (x0, y0, x1, y1). roads: build_tile's (fid, spec, centreline (k, 3), lon); walks: its sidewalk
     runs (dicts with fid, pts, side, w); decks: the bridge decks over the tile [(centreline (k, 3), half
@@ -938,22 +945,46 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
     development: local built-environment samples (development.py) for the street trees, hydrants, benches and bins;
     None: none of those. Lighting and mapped infrastructure stay independent. pole_profile: optional
     poleprofiles profile (PR #505); changes the pole shape and its wire attachment geometry, never its placement or
-    lamp spacing. pole_frame: ENU frame for the position-based country profiles."""
+    lamp spacing. pole_frame: ENU frame for the position-based country profiles. mapped_poles: (n, 2) ENU points of
+    the mapped poles mappedpoles.py draws (road_points): a road with MAPPED_ALONG_MIN of them along it guesses no
+    utility poles (its lamps on posts in town, as where the lines are buried); None: none mapped."""
     pole_at = poleprofiles.selector(pole_profile, pole_frame)
     kit_at = poleprofiles.kit_selector(pole_profile, pole_frame)
     spacing_of = lamp_spacing(region, dense=not town)
     lighting = lighting or {}  # OSM way lighting; absent/unknown keeps the inferred rule
     x0, y0, x1, y1 = box
     by_fid = {fid: (spec, pts) for fid, spec, pts, _ in roads}
+    mapped = (np.asarray(mapped_poles, np.float64).reshape(-1, 2) if mapped_poles is not None
+              else np.empty((0, 2)))
+    along = {}
+
+    def mapped_along(fid):      # are there mapped poles along this road (mappedpoles.py draws those instead)?
+        if fid not in along:
+            sp, pts = by_fid.get(fid, (None, None))
+            hit = False
+            if sp is not None and pts is not None and len(pts) > 1 and len(mapped) >= MAPPED_ALONG_MIN:
+                line = np.asarray(pts, np.float64)[:, :2]
+                reach = sp.width / 2 + MAPPED_ALONG_M
+                near = mapped[np.all((mapped >= line.min(0) - reach) & (mapped <= line.max(0) + reach), axis=1)]
+                hit = sum(_seg_dist_min(p, line) <= reach for p in near) >= MAPPED_ALONG_MIN
+            along[fid] = hit
+        return along[fid]
 
     def overhead(fid):          # does this road's line run on poles (not buried)?
         import franceroads
         sp = by_fid.get(fid, (None, None))[0]
         if sp is not None and franceroads.enabled(sp) and not sp.urban:
             return False
+        if mapped_along(fid):
+            return False
         return _h01(fid, "buried") >= buried
     clearance = clearance if clearance is not None else RoadClearance(
         [(spec.width / 2, pts) for _, spec, pts, _ in roads], decks, bounds=box)
+    import fast
+    bed = fast.Others(list(obstacles)) if obstacles else None
+
+    def on_bed(q):              # is q on (or by) an obstacle's ground?
+        return bed is not None and not bed.clear(np.array([q[0], q[1]]), None, CLEAR_OTHER_M)
     rows = []
     lit = set()
     for wk in walks:
@@ -990,7 +1021,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
         def put(group, spacing, phase, curb_off, height, yaw_fn, clear=END_CLEAR_M, optional=False):
             for p, out in _stations(run, line, spacing, phase, clear, side):
                 q = p[:2] - out * (w / 2 - curb_off)
-                if _owns(box, q[0], q[1]):
+                if _owns(box, q[0], q[1]) and not on_bed(q):
                     if optional:
                         k = int(round((float(_project(line, p[None, :2])[0]) - phase) / spacing))
                         if not decorated(group, p, out, k):
@@ -1012,6 +1043,8 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 ph = _h01(fid, "tphase") * TOWN_POLE_SPACING
                 for p, out in _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side):
                     q = p[:2] - out * (w / 2 - 0.6)
+                    if on_bed(q):
+                        continue
                     yaw = _yaw(out[0], out[1])
                     pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
                     pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
@@ -1103,6 +1136,11 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             n = np.array([-d[1], d[0]]) * side
             q = p[:2] + n * (spec.width / 2 + (POLE_OFF_M if poles else LAMP_EDGE_M))
             inside = _owns(box, q[0], q[1])
+            if on_bed(q):
+                if len(run) > 1 and wires is not None:
+                    wires.extend(_own_spans(run, box))
+                run = []
+                continue
             if not poles:                   # buried lines: lamp posts, their arms over the road
                 if inside:
                     h = (HIGHWAY_LAMP_H["na" if _na(region) else None] if highway and not spec.link

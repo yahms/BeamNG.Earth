@@ -275,7 +275,27 @@ impl Agg {
     }
 }
 
-/// The 1 % low as fps: the frame-time bin the slowest 1 % reach, its upper edge (the slowest bin: under 4 fps).
+/// Whether a build's perf reports are counted: from the counting fix on (mod fe802694, dev.249). The first dev builds
+/// (1.8.2-beta.dev.245 to .248) counted frames while paused or in the background as hitches and only the guard's full
+/// pause as held at the edge; their reports are dropped, as are any older release's.
+pub const FIRST_COUNTED_DEV: u64 = 249;
+pub fn counted_version(v: &str) -> bool {
+    let (base, dev) = match v.split_once(".dev.") {
+        Some((b, d)) => (b, d.parse::<u64>().ok()),
+        None => (v, None),
+    };
+    let nums: Vec<u64> = base.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty()).take(3)
+        .map(|x| x.parse().unwrap_or(0)).collect();
+    let triple = (nums.first().copied().unwrap_or(0), nums.get(1).copied().unwrap_or(0), nums.get(2).copied().unwrap_or(0));
+    match triple.cmp(&(1, 8, 2)) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => dev.map_or(false, |n| n >= FIRST_COUNTED_DEV),
+    }
+}
+
+/// The 1 % low as fps: the frame time the slowest 1 % of frames reach, placed linearly inside its bin (the first
+/// night's reports, read as the bin's upper edge, could only say 4, 10, 20 or 29 fps); the slowest bin: under 4 fps.
 pub fn low1(fh: &[u64]) -> serde_json::Value {
     let n: u64 = fh.iter().sum();
     if n == 0 {
@@ -284,10 +304,16 @@ pub fn low1(fh: &[u64]) -> serde_json::Value {
     let want = (n as f64 * 0.01).ceil() as u64;
     let mut acc = 0;
     for i in (0..fh.len()).rev() {
-        acc += fh[i];
-        if acc >= want {
-            return if i >= EDGES_MS.len() { serde_json::json!(4) } else { serde_json::json!((1000.0 / EDGES_MS[i]).round() as u64) };
+        if acc + fh[i] >= want {
+            if i >= EDGES_MS.len() {
+                return serde_json::json!(4);
+            }
+            let (hi, lo) = (EDGES_MS[i], if i > 0 { EDGES_MS[i - 1] } else { 1000.0 / 240.0 });
+            let f = (want - acc) as f64 / fh[i] as f64;          // (from the bin's slow end)
+            let ms = hi - f * (hi - lo);
+            return serde_json::json!((1000.0 / ms).round() as u64);
         }
+        acc += fh[i];
     }
     serde_json::Value::Null
 }
@@ -405,6 +431,9 @@ impl Perf {
 
     /// A report's perf section from install id (already checked by telemetry.rs), its version and OS.
     pub fn add(&mut self, id: &str, v: &str, os: &str, p: PerfIn, now: Instant, unix_now: u64) {
+        if !counted_version(v) {
+            return;
+        }
         if let Some(s) = &p.setup {
             let mut groups = Vec::new();
             if let Some(g) = label(&s.gpu, 80) { groups.push(format!("gpu:{g}")); }
@@ -553,6 +582,39 @@ impl Perf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_counted_from_the_fix() {
+        assert!(!counted_version("1.8.2-beta.dev.245"));
+        assert!(!counted_version("1.8.2-beta.dev.248"));
+        assert!(counted_version("1.8.2-beta.dev.249"));
+        assert!(counted_version("1.8.2-beta.dev.1000"));
+        assert!(!counted_version("1.8.2-beta"));         // (the release: before the fix)
+        assert!(!counted_version("1.7.3-beta.dev.900"));
+        assert!(counted_version("1.8.3-beta"));
+        assert!(counted_version("1.9.0-beta.dev.1"));
+        assert!(!counted_version(""));
+        assert!(!counted_version("garbage"));
+    }
+
+    #[test]
+    fn low1_inside_its_bin() {
+        // 1000 frames: 990 at 60 fps (bin 3, 14-17 ms), 10 in the 50-100 ms bin: the 1 % point is that bin's fast end
+        let mut fh = [0u64; BINS];
+        fh[3] = 990;
+        fh[7] = 10;
+        assert_eq!(low1(&fh), serde_json::json!(20));
+        // 5 slow (50-100 ms) and 10 at 17-22 ms: the 1 % point halfway into that bin, 19.5 ms: 51 fps, not its edge's 45
+        fh[7] = 5;
+        fh[4] = 10;
+        fh[3] = 985;
+        assert_eq!(low1(&fh), serde_json::json!(51));
+        // the slowest bin: under 4 fps
+        let mut slow = [0u64; BINS];
+        slow[BINS - 1] = 3;
+        slow[0] = 97;
+        assert_eq!(low1(&slow), serde_json::json!(4));
+    }
 
     fn report(gpu: &str, fps60: u64, with_setup: bool) -> PerfIn {
         let w: WindowIn = serde_json::from_value(serde_json::json!({
