@@ -435,6 +435,7 @@ CLEAR_AIM_M = float(os.environ.get("BNE_CLEAR_AIM", "0.5"))
 ENU_SHARE_ON = os.environ.get("BNE_ENU_SHARE", "on") != "off"   # a cell's road parts made once a run for every process (CW_ON)
 CW_HELP = os.environ.get("BNE_CW_HELP", "on") != "off"   # a cell's carriageway regions solved by the processes side by side
 CW_STREET_RISE_M = 2.0     # m a street's own ground at a crossing may stand over its level read past the deck
+CW_WATER_ON = os.environ.get("BNE_CW_WATER", "on") != "off" and WATER_LIFT_ON   # carriageway decks clear water
 RAMP_EASE_M = float(os.environ.get("BNE_RAMP_EASE", "60"))   # m from a street a slip road eases to a street's limits (0: off)
 RAMP_SLOW_GRADE = 0.10      # a slip road's steepest grade at the street it meets (a secondary road's)
 RAMP_SLOW_K = 5.0           # its K there (m per 1 % of grade change: ~40 km/h)
@@ -3582,6 +3583,23 @@ class _Planner:
                     for c in roadsmod._crossings([p_[1]], rails_n):
                         j = nearest(n, i, np.asarray(c[2], f64))
                         data[n]["lo"][j] = max(data[n]["lo"][j], zraw(c[2]) + clear)
+                if p_[2] and CW_WATER_ON:
+                    # (a deck over water clears it as roads.BridgeProfiles' own decks do: a carriageway's deck takes
+                    # this profile instead (roads.DECK_Z_HOOK), and with nothing under it the solve laid the Narrows
+                    # Bridge flat between its abutments, 2026-11-10)
+                    # (as far as the chain's grade can climb from the deck's ends after WATER_CURVE_M of curve: the
+                    # share-of-span rule asked 34 m of the Narrows, 0.15 of its wet run, its abutments at 3 m; dev's
+                    # own deck reached 15.5 m)
+                    pl_ = np.asarray(p_[1], f64)[:, :2]
+                    sp = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pl_, axis=0).T))]
+                    ze = (zraw(pl_[0]), zraw(pl_[-1]))
+                    climb = 0.9 * float(np.min(np.asarray(data[n]["grade"], f64)))    # (per sample near streets)
+                    for q, need in self._cw_water_need(p_[1]):
+                        a = float(sp[int(np.argmin(np.hypot(*(pl_ - q).T)))])
+                        cap = min(ze[0] + climb * max(a - WATER_CURVE_M, 0.0),
+                                  ze[1] + climb * max(float(sp[-1]) - a - WATER_CURVE_M, 0.0))
+                        j = nearest(n, i, q)
+                        data[n]["lo"][j] = max(data[n]["lo"][j], min(need, cap))
                 if p_[2] and streets_n:
                     for c in roadsmod._crossings([p_[1]], [st[0] for st in streets_n]):
                         L = float(np.hypot(*np.diff(p_[1], axis=0).T).sum())
@@ -4802,6 +4820,32 @@ class _Planner:
         if wl >= APPROACH_MIN_LIFT and (best is None or wl > best):
             return min(wl, WATER_MAX_LIFT), others, approaches, True
         return None if best is None else (best, others, approaches, False)
+
+    def _cw_water_need(self, line):
+        """[(point (2,), height)]: a carriageway deck's lowest road heights over water (roads.BridgeProfiles._water:
+        the water's clearance and the bridge's navigation clearance, with its slab and girders), in z_at's (geodetic)
+        heights; [] off water. Never raises."""
+        if self.wet is None:
+            return []
+        try:
+            import bridgetypes
+            ch = self._chains_for()
+            ln = roadsmod.densify(np.asarray(line, np.float64)[:, :2], roadsmod.DECK_STEP)
+            try:
+                nav = bridgetypes.nav_clearance(self.frame, [ln])
+            except Exception:
+                nav = 0.0
+            out = []
+            s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(ln, axis=0).T))]
+            for _k, arc, base, c in ch._water([ln], nav, ch._depth([ln])):
+                q = np.array([np.interp(arc, s, ln[:, 0]), np.interp(arc, s, ln[:, 1])])
+                la, lo, _ = self.frame.enu_to_geodetic(q[None, :1].ravel(), q[None, 1:].ravel(), 0.0)
+                drop = float(self.frame.geodetic_to_enu(la, lo, np.zeros(1))[2][0])    # (ENU under geodetic here)
+                out.append((q, float(base) + float(c) - drop))
+            return out
+        except Exception as e:      # (no water bound rather than no region)
+            log.debug("grading: carriageway water need: %s: %s", type(e).__name__, e)
+            return []
 
     def _water_lift(self, bridge, chain, xy, z_at):
         """m the abutment at xy of a bridge over water must be raised for its deck to reach the water's clearance
