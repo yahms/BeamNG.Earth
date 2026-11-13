@@ -1753,7 +1753,7 @@ def _arcs(p):
     return np.r_[0.0, np.cumsum(dnp.hypot(*np.diff(np.asarray(p.xy, np.float64)[:, :2], axis=0).T))]
 
 
-def _pad_nodes(plans, rank, boxes):
+def _pad_nodes(plans, rank, boxes, crossings=True):
     """[(node xy (2,), [(plan j, arc at the node, direction +1 / -1)])]: the plans' ends joined within CHAIN_JOIN_M
     (three branches or more, or two of different roads at an angle), and the at-grade crossings of two plans away from
     their ends (two branches each)."""
@@ -1799,6 +1799,8 @@ def _pad_nodes(plans, rank, boxes):
             if len({plans[b[0]].rid for b in br}) < 2:
                 continue        # (one road's own parts: its chain)
             nodes.append((xy[i].copy(), br))
+    if not crossings:
+        return nodes            # (tee_nodes: a T is a node, never a crossing; the sweep below is most of the cost)
     # crossings with no node: proper intersections of two plans' centrelines, each away from both plans' ends (every
     # segment bucketed on a PAD_GRID_M grid, the pairs within a bucket tested at once)
     segs = [(j, np.asarray(p.xy, np.float64)[:, :2]) for j, p in enumerate(plans) if len(p.xy) >= 2]
@@ -1995,6 +1997,225 @@ def junction_pads(plans, specs, nodes=None):
                 bnew[win] = bank
                 p.bank = bnew
     return nodes
+
+
+# A T junction's stem tilted to the road it joins (the user, 2026-11-13: "the cause of the problem is road levelling ...
+# if the straight-through road is going up or down a hill, the side road levelling impacts the levelling of the
+# through-road"). grade_points lays every road's core level across (or at its bank), and blends the cores where they
+# meet. At a T on a hill the stem is level across while the through road climbs along its length, the very direction
+# the stem lies across: the stem's mouth pulls the through road's edge to the node's height, a hump on the downhill side
+# of the mouth and a dip on the uphill one (an 8 % street, a residential T: lanes 13-27 cm off; under a primary, whose
+# carriageway grade_points holds, its shoulder 24-31 cm, where cars cut the corner; a trunk or motorway is never held).
+# So at a T (three branches, two of them facing each other: the through road; the third, the stem, ranked no higher):
+#   - the through road's surface at the node is a plane: its grade along it (both branches' leaving grades, the central
+#     difference) and its own cross slope (Plan.bank) across;
+#   - the stem lies on that plane over the through road's core (its centreline height and its cross slope: its core
+#     tilted as the through road's surface falls across it), so the two surfaces agree where they overlap;
+#   - past the core its cross slope eases back to its own (cosine) over a length its own attributes set: the rotation a
+#     driver feels is the edge's rise against the centreline's, the superelevation runoff rule
+#     L = (pi / 2) x road_half x delta_e / rel(v) (pi / 2: the cosine's steepest), rel(v) the most relative gradient
+#     at the stem's speed (its limit, else its class's: TEE_KMH), from AASHTO's runoff table (TEE_REL_GRADIENT); within
+#     [TEE_MIN_M, TEE_MAX_M] and at most TEE_SHARE of the stem's part past the core (a short street between two Ts
+#     keeps room at its other end). A wide or fast stem warps over a long approach, a lane or a driveway over a short one.
+# The tilt is the through road's own solved surface (its plan's grade and bank), never the terrain's: it only makes the
+# two roads meet. Not a merge or a diverge (a slip road leaves a freeway at a shallow angle: TEE_MIN_SIN), not a stem
+# that outranks its through road (a motorway ramp's end at a street), not where the through road is flat
+# and the stem ends on it (TEE_MIN_STEP_M, checked first). The through road is not changed. Only the stem's cross slope (and its centreline
+# over the core, by the through road's own bank there) moves. The junction pads (BNE_JUNCTION_PAD=1) do this and more
+# at every node: with them on this pass stands aside. BNE_TEE_CROSSFALL=off: the stems level across, as before.
+TEE_ON = os.environ.get("BNE_TEE_CROSSFALL", "on") not in ("off", "0", "false")
+TEE_FACE_DEG = 150.0        # deg: the through branches leave the node at least this far apart (else a Y, a bend)
+TEE_MIN_SIN = 0.5           # the stem meets the through road at 30 degrees or more (shallower: a merge, a slip road)
+TEE_GRADE_M = 15.0          # m along each through branch its grade leaving the node is taken over
+TEE_MAX_CROSS = 0.20        # never tilted steeper across (bad data); a 20 % street's stems still meet it
+TEE_MAX_DZ_M = 0.5          # m: the stem's centreline moved onto the plane over the core at most this (else its tilt alone)
+TEE_MIN_M = 6.0             # m: the shortest ease back to its own cross slope ...
+TEE_MAX_M = 60.0            # ... the longest ...
+TEE_SHARE = 0.4             # ... and at most this share of the stem's part past the through road's core
+TEE_MIN_DELTA = 0.002       # a smaller change of cross slope (m per m) is not made
+TEE_MIN_STEP_M = 0.02       # m: a through road so near flat (its surface's steepest fall x the stem's half width) that a
+                            # level stem's edge is within this of it is left alone, before any of the stem's arrays
+                            # are built (O(1) per T: most Ts in a town are on level ground)
+# design speed (km/h) of a stem with no speed limit mapped, by class (a slip road: TEE_LINK_KMH)
+TEE_KMH = {"motorway": 110.0, "trunk": 90.0, "primary": 70.0, "secondary": 60.0, "tertiary": 50.0,
+           "unclassified": 50.0, "residential": 40.0, "living_street": 20.0, "service": 20.0, "track": 20.0}
+TEE_OTHER_KMH = 40.0
+TEE_LINK_KMH = 50.0
+# the most relative gradient (edge against centreline, m per m) by design speed (km/h): AASHTO's superelevation runoff
+# table (A Policy on Geometric Design, Table 3-15), linear between, held at its ends
+TEE_REL_GRADIENT = ((20.0, 0.0080), (30.0, 0.0075), (40.0, 0.0070), (50.0, 0.0065), (60.0, 0.0060),
+                    (70.0, 0.0055), (80.0, 0.0050), (90.0, 0.0047), (100.0, 0.0044), (110.0, 0.0041),
+                    (120.0, 0.0038), (130.0, 0.0035))
+
+
+def tee_kmh(spec):
+    """The design speed (km/h) a T's stem eases its cross slope at: its speed limit, else its class's (TEE_KMH). Pure."""
+    k = getattr(spec, "kmh", None)
+    if k is not None and k == k and k > 0:
+        return float(k)
+    cls = spec.cls or ""
+    if cls.endswith("_link") or getattr(spec, "link", False):
+        return TEE_LINK_KMH
+    return TEE_KMH.get(cls, TEE_OTHER_KMH)
+
+
+def tee_ease_m(spec, road_half, delta_e, room=math.inf):
+    """m over which a stem's cross slope eases from the through road's plane back to its own (cosine): the runoff rule
+    (pi / 2) x road_half x |delta_e| / rel(v) within [TEE_MIN_M, TEE_MAX_M], at most TEE_SHARE x room (m of the stem past
+    the core). Pure."""
+    v = tee_kmh(spec)
+    sp, rel = zip(*TEE_REL_GRADIENT)
+    r = float(np.interp(v, sp, rel))
+    want = 0.5 * math.pi * max(float(road_half), 0.0) * abs(float(delta_e)) / r
+    length = min(max(want, TEE_MIN_M), TEE_MAX_M)
+    return max(min(length, TEE_SHARE * room), VERTEX_STEP)
+
+
+def tee_nodes(plans, specs, nodes=None):
+    """[(node xy (2,), stem (plan j, arc at the node, direction +1 / -1 away from it), [the two through branches],
+    through axis u (2,) (from the second through branch's side to the first's))]: the T junctions among the plans'
+    nodes (_pad_nodes', or nodes): three branches of at least two roads, two leaving at least TEE_FACE_DEG apart, the third
+    meeting their line at TEE_MIN_SIN or more, at one of its own ends, of a road other than theirs and ranked no higher
+    than either."""
+    if len(plans) < 2:
+        return []
+    rank = np.array([road_rank(sp) for sp in specs])
+    if nodes is None:
+        boxes = np.array([q.bbox for q in plans], np.float64).reshape(-1, 4)
+        nodes = _pad_nodes(plans, rank, boxes, crossings=False)
+    lim = -dmath.cos(math.radians(TEE_FACE_DEG))
+    out = []
+    arcs = {}
+    for node, br in nodes:
+        if len(br) != 3:
+            continue
+        dirs = []
+        for j, arc, sgn in br:
+            s = arcs.get(j)
+            if s is None:
+                s = arcs[j] = _arcs(plans[j])
+            avail = float(s[-1] - arc) if sgn > 0 else float(arc)
+            look = min(CHAIN_LOOK_M, avail)
+            if look <= 1e-6:
+                break
+            p = plans[j]
+            d = np.array([np.interp(arc + sgn * look, s, p.xy[:, 0]) - np.interp(arc, s, p.xy[:, 0]),
+                          np.interp(arc + sgn * look, s, p.xy[:, 1]) - np.interp(arc, s, p.xy[:, 1])])
+            n_ = float(dnp.hypot(d[0], d[1]))
+            if n_ < 1e-9:
+                break
+            dirs.append(d / n_)
+        if len(dirs) != 3:
+            continue
+        # (the through pair: the two most nearly opposite)
+        pairs = [(float(dnp.matmul(dirs[a], dirs[b])), a, b) for a, b in ((0, 1), (0, 2), (1, 2))]
+        cos_ab, a, b = min(pairs)
+        if cos_ab > lim:
+            continue
+        c = 3 - a - b
+        js, arc_s, sgn_s = br[c]
+        s = arcs[js]
+        if not (arc_s <= 1e-6 or arc_s >= float(s[-1]) - 1e-6):
+            continue                # (the stem must end here: a road going on through is no stem)
+        ja, jb = br[a][0], br[b][0]
+        rid_s = plans[js].rid
+        if rid_s == plans[ja].rid or rid_s == plans[jb].rid:
+            continue                # (one road turning: its own chain)
+        if rank[js] > min(rank[ja], rank[jb]):
+            continue                # (the higher road turns here: not a stem)
+        u = dirs[a] - dirs[b]
+        u /= max(float(dnp.hypot(u[0], u[1])), 1e-12)
+        if abs(float(u[0] * dirs[c][1] - u[1] * dirs[c][0])) < TEE_MIN_SIN:
+            continue                # (a merge, a fork: not a T)
+        out.append((np.asarray(node, np.float64), br[c], [br[a], br[b]], u))
+    return out
+
+
+def tee_crossfall(plans, specs, nodes=None):
+    """TEE_* above: each T junction's stem (in place) on the through road's surface over its core, its cross slope eased
+    back to its own past it over a length its own attributes set (tee_ease_m). plans: [Plan], specs: their Specs; nodes:
+    _pad_nodes' (else found). Returns the number of stems changed."""
+    if not TEE_ON or PAD_ON or len(plans) < 2:
+        return 0
+    tees = tee_nodes(plans, specs, nodes)
+    done = 0
+    for node, (js, arc_s, sgn_s), through, u in tees:
+        # the through road's surface at the node: its height, its grade along u, its cross slope across (toward u's left)
+        zs, grs, cross, halves = [], [], [], []
+        for j, arc, sgn in through:
+            q = plans[j]
+            s = _arcs(q)
+            avail = float(s[-1] - arc) if sgn > 0 else float(arc)
+            gl = min(TEE_GRADE_M, avail)
+            z_n = float(np.interp(arc, s, q.z))
+            zs.append(z_n)
+            grs.append((float(np.interp(arc + sgn * gl, s, q.z)) - z_n) / gl if gl > 1e-6 else 0.0)
+            cross.append(0.0 if q.bank is None else float(np.interp(arc, s, q.bank)) * sgn)    # (toward the branch's left)
+            halves.append(float(q.half))
+        z0 = 0.5 * (zs[0] + zs[1])
+        if abs(zs[0] - zs[1]) > JUNCTION_MAX_M:
+            continue                # (two levels: bad data)
+        g_u = 0.5 * (grs[0] - grs[1])               # (the first branch leaves along u, the second against it)
+        c_u = 0.5 * (cross[0] - cross[1])           # (the second branch's left is u's right)
+        nu = np.array([-u[1], u[0]])
+        G = g_u * u + c_u * nu
+        t = float(dnp.hypot(G[0], G[1]))
+        p = plans[js]
+        z_end = float(p.z[0] if arc_s <= 1e-6 else p.z[-1])
+        if t * float(p.road_half) < TEE_MIN_STEP_M and abs(z_end - z0) < TEE_MIN_STEP_M:
+            continue                # (flat, and the stem already ends on it: nothing to do, nothing built for it)
+        if t > TEE_MAX_CROSS:
+            G *= TEE_MAX_CROSS / t
+        sp = specs[js]
+        s = _arcs(p)
+        xy = np.asarray(p.xy, np.float64)[:, :2]
+        if len(xy) < 2:
+            continue
+        avail = float(s[-1])
+        d_all = (s - arc_s) * sgn_s                 # (m from the node along the stem)
+        # the stem over the through road's core: to the core's edge at the stem's angle, and its own far corner past it
+        dir_s = np.array([np.interp(arc_s + sgn_s * min(CHAIN_LOOK_M, avail), s, xy[:, 0]) - node[0],
+                          np.interp(arc_s + sgn_s * min(CHAIN_LOOK_M, avail), s, xy[:, 1]) - node[1]])
+        dir_s /= max(float(dnp.hypot(dir_s[0], dir_s[1])), 1e-12)
+        sin = max(abs(float(u[0] * dir_s[1] - u[1] * dir_s[0])), TEE_MIN_SIN)
+        cos = abs(float(dnp.matmul(u, dir_s)))
+        reach = min(max(halves) / sin + float(p.road_half) * cos / sin, TEE_SHARE * avail)
+        # the plane's tilt across the stem at each vertex (toward the stem plan's own left)
+        tan = np.gradient(xy, axis=0)
+        tan /= np.maximum(dnp.hypot(tan[:, 0], tan[:, 1]), 1e-12)[:, None]
+        e_plane = G[0] * -tan[:, 1] + G[1] * tan[:, 0]
+        own = np.zeros(len(xy)) if p.bank is None else np.asarray(p.bank, np.float64)
+        core = (d_all >= -1e-9) & (d_all <= reach)
+        if not core.any():
+            continue
+        de = float(d_all[core].max())
+        k_e = int(np.argmax(np.where(core, d_all, -np.inf)))
+        delta_e = float(e_plane[k_e] - own[k_e])
+        plane_z = z0 + G[0] * (xy[:, 0] - node[0]) + G[1] * (xy[:, 1] - node[1])
+        if abs(delta_e) < TEE_MIN_DELTA and float(np.abs(e_plane[core] - own[core]).max()) < TEE_MIN_DELTA \
+                and float(np.abs(plane_z[core] - np.asarray(p.z, np.float64)[core]).max()) < TEE_MIN_STEP_M:
+            continue
+        ease = tee_ease_m(sp, p.road_half, delta_e, avail - de)
+        w = 0.5 * (1.0 + dnp.cos(np.pi * np.clip((d_all - de) / ease, 0.0, 1.0)))
+        w[d_all < -1e-9] = 0.0
+        bank = own + w * (e_plane - own)
+        # its centreline over the core on the plane (the through road's own bank there; the snap held it at the
+        # through road's centreline height), the edge's difference eased out with the cross slope
+        z = np.asarray(p.z, np.float64).copy()
+        dz = plane_z - z
+        if float(np.abs(dz[core]).max()) <= TEE_MAX_DZ_M:
+            dz_edge = float(dz[k_e])
+            # (a height step at the core's edge, an equal-ranked stem the snap left as a continuation of a through road
+            # split at the node: eased out at most JUNCTION_EASE_GRADE more grade, as the snap's own steps are)
+            zl = max(ease, min(ease_length(dz_edge, pad_class_w(sp) < PAD_LANDING_MIN_W), TEE_SHARE * (avail - de)))
+            wz = 0.5 * (1.0 + dnp.cos(np.pi * np.clip((d_all - de) / max(zl, VERTEX_STEP), 0.0, 1.0)))
+            add = np.where(core, dz, wz * dz_edge)
+            add[d_all < -1e-9] = 0.0
+            z = z + add
+        p.z = z
+        p.bank = bank
+        done += 1
+    return done
 
 
 def guard_limits(spec, plan):
@@ -2608,6 +2829,11 @@ class _Planner:
                     snap_junctions([p for _f, p in plans], pspecs)
                 except Exception as e:      # the welded heights alone rather than no grading
                     log.debug("grading: junctions after welding of %s: %s: %s", key, type(e).__name__, e)
+            if TEE_ON and not PAD_ON and plans:
+                try:            # each T's stem tilted to the through road's surface (after every pass that moves it)
+                    tee_crossfall([p for _f, p in plans[:len(pspecs)]], pspecs, pad_nodes)
+                except Exception as e:      # the stems level across rather than no grading
+                    log.debug("grading: T junction cross slopes of %s: %s: %s", key, type(e).__name__, e)
             if plans:
                 try:            # a pass road's widened hairpins (roads.HAIRPIN_*): its core wider round each
                     hairpin_cores(plans, pspecs, self.frame)
