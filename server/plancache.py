@@ -84,7 +84,10 @@ def plans_format():
     import grading
     # (the grade guard, off by default, makes other plans: its own key, so that the two never mix and nobody else's
     # plans are thrown away)
-    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "")
+    # (and so does the T junctions' cross slope switched off, BNE_TEE_CROSSFALL=off: a before / after comparison
+    # in game reads the plans of the mode it runs in)
+    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "") + \
+        ("" if grading.TEE_ON else ".tee0")
 
 
 FRAMES = "r10"          # the plans' frames: their planning regions' (geotiles.PLAN_Z), not an anchor's
