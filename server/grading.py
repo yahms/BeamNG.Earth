@@ -2019,8 +2019,8 @@ def junction_pads(plans, specs, nodes=None):
 #     keeps room at its other end). A wide or fast stem warps over a long approach, a lane or a driveway over a short one.
 # The tilt is the through road's own solved surface (its plan's grade and bank), never the terrain's: it only makes the
 # two roads meet. Not a merge or a diverge (a slip road leaves a freeway at a shallow angle: TEE_MIN_SIN), not a stem
-# that outranks its through road (a motorway ramp's end at a street), never steeper than TEE_MAX_SURFACE across and
-# along together (the road's mesh would sink under the ground), not where the through road is flat
+# that outranks its through road (a motorway ramp's end at a street), past the core never steeper than TEE_MAX_SURFACE
+# across and along together (the road's mesh would sink under the ground), not where the through road is flat
 # and the stem ends on it (TEE_MIN_STEP_M, checked first). The through road is not changed. Only the stem's cross slope (and its centreline
 # over the core, by the through road's own bank there) moves. The junction pads (BNE_JUNCTION_PAD=1) do this and more
 # at every node: with them on this pass stands aside. BNE_TEE_CROSSFALL=off: the stems level across, as before.
@@ -2034,12 +2034,12 @@ TEE_MIN_M = 6.0             # m: the shortest ease back to its own cross slope .
 TEE_MAX_M = 60.0            # ... the longest ...
 TEE_SHARE = 0.4             # ... and at most this share of the stem's part past the through road's core
 TEE_MIN_DELTA = 0.002       # a smaller change of cross slope (m per m) is not made
-TEE_MAX_SURFACE = 0.28      # the stem's surface at most this steep (its own grade along and its tilt across together,
-                            # m per m): roadmesh holds a road's mesh down to a cell's lowest corner where the cell's
-                            # corners are FOLLOW_STEP_M (0.45 of a square) apart, the ground showing through it. A dirt
-                            # road leaving an asphalt one at 33 % tilted 18 % on top did that (Canning Mills Road,
-                            # Kelmscott, 2026-11-14: the strip under the ground for 6 m). The whole tilt scaled down to
-                            # fit (no twist where it bites); a stem steeper on its own than this keeps its level section
+TEE_MAX_SURFACE = 0.28      # past the through road's core, the stem's surface at most this steep (its own grade along
+                            # and its tilt across together, m per m, point by point): roadmesh holds a road's mesh down
+                            # to a cell's lowest corner where the cell's corners are FOLLOW_STEP_M (0.45 of a square)
+                            # apart, the ground showing through it. A dirt road leaving an asphalt one at 33 % tilted
+                            # 18 % on top did that (Canning Mills Road, Kelmscott, 2026-11-14: the strip under the
+                            # ground for 6 m). Over the core the stem stays on the through road's surface regardless
 TEE_MIN_STEP_M = 0.02       # m: a through road so near flat (its surface's steepest fall x the stem's half width) that a
                             # level stem's edge is within this of it is left alone, before any of the stem's arrays
                             # are built (O(1) per T: most Ts in a town are on level ground)
@@ -2219,16 +2219,17 @@ def tee_crossfall(plans, specs, nodes=None):
             add = np.where(core, dz, wz * dz_edge)
             add[d_all < -1e-9] = 0.0
             z = z + add
-        # the stem's own grade with the tilt across it under TEE_MAX_SURFACE: the whole tilt (the core's too) scaled
+        # past the through road's core, the stem's own grade with the tilt across it under TEE_MAX_SURFACE, point by
+        # point (a steep driveway or track twists back within a few metres of the kerb). Over the core the stem is
+        # the through road's surface itself (never steeper than it): always on it, or its level mouth pulls the
+        # kerb into a hump (Hall Road, Roleystone, 2026-11-14: driveways at ~50 % left level, 13-22 cm humps)
         tilt = bank - own
-        on = np.abs(tilt) > TEE_MIN_DELTA            # (where the tilt has faded out, it sinks nothing)
-        if on.any():
-            g = np.abs(np.gradient(z, s)) if len(z) > 1 else np.zeros(len(z))
-            room = np.sqrt(np.maximum(TEE_MAX_SURFACE ** 2 - g[on] ** 2, 0.0)) - np.abs(own[on])
-            k = float(np.clip(np.min(np.maximum(room, 0.0) / np.abs(tilt[on])), 0.0, 1.0))
-            if k < 0.05:
-                continue            # (too steep a stem to tilt: as before)
-            bank = own + k * tilt
+        past = (d_all > de + 1e-9) & (np.abs(tilt) > 1e-9)
+        if past.any() and len(z) > 1:
+            g = np.abs(np.gradient(z, s))
+            lim = np.maximum(np.sqrt(np.maximum(TEE_MAX_SURFACE ** 2 - g ** 2, 0.0)) - np.abs(own), 0.0)
+            tilt[past] = np.sign(tilt[past]) * np.minimum(np.abs(tilt[past]), lim[past])
+            bank = own + tilt
         p.z = z
         p.bank = bank
         done += 1

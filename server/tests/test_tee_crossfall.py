@@ -199,24 +199,30 @@ class TeeCrossfallTest(unittest.TestCase):
         grading.snap_junctions(ps, sp)
         return ps, sp
 
+    def check_steep(self, climb):
+        ps, sp = self.steep_stem(climb)
+        self.assertEqual(grading.tee_crossfall(ps, sp), 1)
+        p = ps[2]
+        d = grading._arcs(p)
+        g = np.abs(np.gradient(p.z, d))
+        core = d <= RESIDENTIAL.width / 2 + 1.0
+        # over the through road: on its surface (an 8 % grade across the stem)
+        np.testing.assert_allclose(np.abs(p.bank[core]), GRADE, atol=1e-6)
+        # past it: grade and tilt together within what the mesh can follow
+        past = ~core & (np.abs(p.bank) > 1e-9)
+        if past.any():
+            self.assertLessEqual(float(np.hypot(g, p.bank)[past].max()), grading.TEE_MAX_SURFACE + 1e-6)
+        return p, core
+
     def test_a_steep_stem_is_tilted_no_further_than_its_mesh_can_follow(self):
         # (Canning Mills Road, Kelmscott: a dirt road falling 33 % from the asphalt, tilted 18 % on top, its strip
         # under the ground: roadmesh holds a mesh to a cell's lowest corner past FOLLOW_STEP_M)
-        ps, sp = self.steep_stem(0.20)
-        self.assertEqual(grading.tee_crossfall(ps, sp), 1)
-        p = ps[2]
-        g = np.abs(np.gradient(p.z, grading._arcs(p)))
-        total = np.hypot(g, p.bank)
-        tilted = np.abs(p.bank) > grading.TEE_MIN_DELTA
-        self.assertTrue(tilted.any(), "still tilted, less")
-        self.assertLessEqual(float(total[tilted].max()), grading.TEE_MAX_SURFACE + 1e-6)
+        self.check_steep(0.20)
 
-    def test_a_stem_too_steep_on_its_own_keeps_its_level_section(self):
-        ps, sp = self.steep_stem(0.33)
-        z = ps[2].z.copy()
-        self.assertEqual(grading.tee_crossfall(ps, sp), 0)
-        np.testing.assert_array_equal(ps[2].z, z)
-        self.assertIsNone(ps[2].bank)
+    def test_a_very_steep_stem_still_meets_the_road_then_twists_back(self):
+        # (Hall Road, Roleystone: driveways at ~50 % left level put 13-22 cm humps in the kerb)
+        p, core = self.check_steep(0.50)
+        self.assertLess(float(np.abs(p.bank[~core]).max()), GRADE, "past the kerb, less than the full tilt")
 
     def test_off_and_beside_the_pads_as_before(self):
         for patch in (("TEE_ON", False), ("PAD_ON", True)):
