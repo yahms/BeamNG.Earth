@@ -189,6 +189,35 @@ class TeeCrossfallTest(unittest.TestCase):
         self.assertEqual(grading.tee_crossfall(ps, sp), 0)
         np.testing.assert_array_equal(ps[2].z, z)
 
+    def steep_stem(self, climb):
+        """A dirt road leaving an 8 % street at a right angle, climbing `climb` away from it (snapped to it first)."""
+        ln_w, ln_e, st = line(-200.0, 0.0, 0.0, 0.0), line(0.0, 0.0, 200.0, 0.0), line(0.0, 0.0, 0.0, 120.0)
+        track = roads.Spec(4.0, "unpaved", False, "track", False)
+        ps = [plan(ln_w, hill(ln_w), RESIDENTIAL, 1), plan(ln_e, hill(ln_e), RESIDENTIAL, 2),
+              plan(st, 50.0 + climb * st[:, 1], track, 9)]
+        sp = [RESIDENTIAL, RESIDENTIAL, track]
+        grading.snap_junctions(ps, sp)
+        return ps, sp
+
+    def test_a_steep_stem_is_tilted_no_further_than_its_mesh_can_follow(self):
+        # (Canning Mills Road, Kelmscott: a dirt road falling 33 % from the asphalt, tilted 18 % on top, its strip
+        # under the ground: roadmesh holds a mesh to a cell's lowest corner past FOLLOW_STEP_M)
+        ps, sp = self.steep_stem(0.20)
+        self.assertEqual(grading.tee_crossfall(ps, sp), 1)
+        p = ps[2]
+        g = np.abs(np.gradient(p.z, grading._arcs(p)))
+        total = np.hypot(g, p.bank)
+        tilted = np.abs(p.bank) > grading.TEE_MIN_DELTA
+        self.assertTrue(tilted.any(), "still tilted, less")
+        self.assertLessEqual(float(total[tilted].max()), grading.TEE_MAX_SURFACE + 1e-6)
+
+    def test_a_stem_too_steep_on_its_own_keeps_its_level_section(self):
+        ps, sp = self.steep_stem(0.33)
+        z = ps[2].z.copy()
+        self.assertEqual(grading.tee_crossfall(ps, sp), 0)
+        np.testing.assert_array_equal(ps[2].z, z)
+        self.assertIsNone(ps[2].bank)
+
     def test_off_and_beside_the_pads_as_before(self):
         for patch in (("TEE_ON", False), ("PAD_ON", True)):
             ps, sp = tee(PRIMARY, RESIDENTIAL)
